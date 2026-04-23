@@ -32,3 +32,21 @@ This is a genuine false positive of our filter at 512³; at 1024³ the
 ribbing would be smoother and the VLM would likely accept the mesh.
 This illustrates the trade-off between Stage 1 resolution and downstream
 acceptance rates.
+
+## `chair_accepted_4view.png`
+
+Sample #3 from the 20-mesh benchmark. HSSD mesh `2a7342c1f2…` (a
+wall-mounted shelf/chair structure) after the full pipeline:
+
+- Stage 1 watertight: ✓ (1.16M faces out)
+- Stage 3 canonicalize: correct +Y up
+- Stage 4 ray agreement: 0.995, VAE chamfer 0.084 (well below 0.15 threshold)
+- Stage 2 VLM: "chair", quality 3, **accepted**
+
+## `appliance_accepted_4view.png`
+
+Sample #5 from the benchmark. A voxelized household appliance:
+
+- Qwen3-VL correctly identifies this as "appliance", quality 4
+- VAE chamfer 0.057 (clean)
+- Accepted.
