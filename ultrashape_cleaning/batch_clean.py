@@ -38,6 +38,47 @@ from typing import Optional
 from .clean_mesh import CleanResult, PipelineConfig, clean_mesh_pipeline
 
 
+class VLMDaemonClient:
+    """Persistent subprocess that keeps Qwen3-VL loaded between meshes."""
+
+    def __init__(self, python_exe: str, model_path: str, device: str = "cuda",
+                 cwd: str = "/moganshan/afs_a/lbx/utils/mesh_clean",
+                 cuda_visible_devices: Optional[str] = None):
+        import subprocess, os, json as _json
+        self._json = _json
+        env = os.environ.copy()
+        if cuda_visible_devices is not None:
+            env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
+        self.proc = subprocess.Popen(
+            [python_exe, "-m", "ultrashape_cleaning.vlm_filter", "serve",
+             "--model-path", model_path, "--device", device],
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True, env=env, cwd=cwd, bufsize=1,
+        )
+        # Wait for "ready".
+        line = self.proc.stdout.readline().strip()
+        info = self._json.loads(line) if line else {}
+        self.ready = info.get("ready", False)
+        self.model_name = info.get("model")
+
+    def infer(self, grid_png: str, mesh_id: str, out_json: str,
+              cache_dir: Optional[str] = None, prompt_lang: str = "en") -> dict:
+        req = {"grid": grid_png, "mesh_id": mesh_id, "out_json": out_json,
+               "cache_dir": cache_dir, "prompt_lang": prompt_lang}
+        self.proc.stdin.write(self._json.dumps(req) + "\n")
+        self.proc.stdin.flush()
+        line = self.proc.stdout.readline()
+        return self._json.loads(line)
+
+    def close(self):
+        try:
+            self.proc.stdin.write(self._json.dumps({"cmd": "quit"}) + "\n")
+            self.proc.stdin.flush()
+            self.proc.wait(timeout=30)
+        except Exception:
+            self.proc.kill()
+
+
 def _collect_meshes(input_dir: Path, patterns: list[str]) -> list[Path]:
     out: list[Path] = []
     for pat in patterns:

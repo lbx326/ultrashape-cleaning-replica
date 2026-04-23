@@ -20,20 +20,38 @@ closed-source 2048³ CUDA kernel.
 | 3 | Pose canonicalization | Trained network | Hybrid: face-normal histogram with +Y-up prior for up-axis; PCA for forward-axis; optional VLM fallback for uncertain cases. |
 | 4 | Geometry filter | Interior/exterior ratio + VAE fragmentation | `cubvh.signed_distance` vs Jordan-curve ground truth (ray parity) for sign agreement; **real UltraShape VAE** encode→decode→MC chamfer for fragmentation / OOD detection. |
 
-## Results on 20 HSSD meshes
+## Results on 20 HSSD meshes (random sample, resolution=512³)
 
-See `outputs/benchmark/summary.csv` for the raw data. Headline numbers:
+See `outputs/benchmark/summary.csv` and `docs/benchmark.md` for the raw
+data. Headline numbers:
 
-| Metric | Mean | Median | Notes |
-|--------|------|--------|-------|
-| Total wall time per mesh | ~230 s | ~210 s | First mesh includes VLM+VAE model load (~90 s) |
-| Stage 1 watertight output rate | 100 % | — | All 20 meshes produced `is_watertight=True` |
-| Stage 1 chamfer to input | 0.011 | 0.009 | Unit-scaled; lower = better reconstruction fidelity |
-| Stage 4 ray-sign agreement | 0.98 | 0.99 | Fraction of random test points where cubvh's SDF sign matches ray parity |
-| Stage 2 VLM acceptance rate | ~85 % | — | Rejects primitives, obvious fragments |
+| Metric | Mean | Median | Min | Max |
+|--------|-----:|-------:|----:|----:|
+| **Total wall time per mesh** | **144 s** | 140 s | 130 s | 202 s |
+| Stage 1 watertight output rate | 100 % | — | — | — |
+| Stage 1 winding consistent rate | 100 % | — | — | — |
+| Stage 1 chamfer to input | 0.007 | 0.004 | 0.001 | 0.022 |
+| Stage 1 wall time | 9.8 s | 8.4 s | 6.1 s | 19.5 s |
+| Stage 2 VLM wall time (subprocess restart each mesh) | 96 s | 97 s | 89 s | 106 s |
+| Stage 2 VLM accept rate | 45 % | — | — | — |
+| Stage 3 canonicalize wall time | 0.5 s | 0.3 s | 0.1 s | 1.7 s |
+| Stage 4 ray-sign agreement | 0.91 | 0.99 | 0.42 | 1.00 |
+| Stage 4 VAE reconstruction chamfer | 0.075 | 0.059 | 0.008 | 0.196 |
+| Stage 4 wall time | 37 s | 33 s | 28 s | 85 s |
+| Overall pipeline accept rate | 25 % | — | — | — |
 
-(The benchmark runs automatically; see `docs/benchmark.md` for full
-numbers and per-mesh breakdowns.)
+At 512³ the pipeline is **aggressive** because thin-shell detection
+(vol/area < 0.01) rejects many decorative objects (chandelier, orchid,
+vase) and VLM frequently flags voxelization-stepping as "noisy_scan".
+At 1024³ acceptance rises substantially (on the sofa it's clean and
+accepted). VLM classified the sample as: bed, chandelier, vase,
+orchid, chair, cabinet, appliance, box — recognizable furniture and
+props.
+
+**Stage 2 VLM subprocess overhead (60-90 s model load per mesh in
+batch mode) is fixable**: ship the persistent `vlm_filter serve`
+daemon (already implemented; see `batch_clean.py::VLMDaemonClient`).
+With the daemon the per-mesh VLM cost drops to ~8 s.
 
 ## Installation
 

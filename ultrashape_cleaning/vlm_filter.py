@@ -434,6 +434,79 @@ def _cli_infer(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cli_serve(args: argparse.Namespace) -> int:
+    """Persistent daemon mode. Reads JSONL from stdin, writes JSONL to stdout.
+
+    Protocol
+    --------
+    Input (one JSON object per line):
+        {"grid": "...", "mesh_id": "...", "out_json": "...",
+         "cache_dir": "...", "prompt_lang": "en"}
+
+    Output (one JSON object per line):
+        {"grid": "...", "mesh_id": "...", "ok": true,
+         "result": <VLMResult as dict>}
+        # or
+        {"grid": "...", "mesh_id": "...", "ok": false, "error": "..."}
+
+    Termination: a line containing {"cmd": "quit"} or EOF.
+    """
+    import sys as _sys
+    client = Qwen3VLClient.from_local(
+        path=args.model_path, device=args.device,
+        dtype=args.dtype, attn_impl=args.attn_impl,
+    )
+    print(json.dumps({"ready": True, "model": client.model_name}),
+          flush=True, file=_sys.stdout)
+    for line in _sys.stdin:
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            req = json.loads(line)
+        except Exception as e:
+            _sys.stdout.write(json.dumps(
+                {"ok": False, "error": f"bad_json:{e}"}) + "\n")
+            _sys.stdout.flush()
+            continue
+        if req.get("cmd") == "quit":
+            break
+        try:
+            prompt = (DEFAULT_PROMPT_ZH
+                      if req.get("prompt_lang") == "zh"
+                      else DEFAULT_PROMPT_EN)
+            result = run_vlm_filter(
+                grid_png=req["grid"],
+                mesh_sha256=req["mesh_id"],
+                client=client,
+                prompt=prompt,
+                prompt_lang=req.get("prompt_lang", "en"),
+                cache_dir=req.get("cache_dir"),
+            )
+            out_path = req.get("out_json")
+            if out_path:
+                Path(out_path).parent.mkdir(parents=True, exist_ok=True)
+                Path(out_path).write_text(result.to_json(), encoding="utf-8")
+            _sys.stdout.write(json.dumps({
+                "grid": req.get("grid"),
+                "mesh_id": req.get("mesh_id"),
+                "ok": True,
+                "result": dataclasses.asdict(result),
+            }, ensure_ascii=False) + "\n")
+            _sys.stdout.flush()
+        except Exception as e:
+            import traceback
+            _sys.stdout.write(json.dumps({
+                "grid": req.get("grid"),
+                "mesh_id": req.get("mesh_id"),
+                "ok": False,
+                "error": str(e),
+                "traceback": traceback.format_exc()[-500:],
+            }) + "\n")
+            _sys.stdout.flush()
+    return 0
+
+
 def main(argv: Optional[list[str]] = None) -> int:
     p = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -462,6 +535,16 @@ def main(argv: Optional[list[str]] = None) -> int:
     pi.add_argument("--attn-impl", default=None,
                     help="e.g. flash_attention_2 or sdpa")
     pi.set_defaults(func=_cli_infer)
+
+    # serve (daemon)
+    ps = sub.add_parser("serve", help="Persistent JSONL daemon mode")
+    ps.add_argument("--model-path",
+                    default="/moganshan/afs_a/anmt/action/Qwen3-VL/"
+                            "Qwen3-VL-8B-Instruct/")
+    ps.add_argument("--device", default="cuda")
+    ps.add_argument("--dtype", default="bfloat16")
+    ps.add_argument("--attn-impl", default=None)
+    ps.set_defaults(func=_cli_serve)
 
     args = p.parse_args(argv)
     return args.func(args)
