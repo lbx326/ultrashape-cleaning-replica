@@ -1,0 +1,39 @@
+# Build/cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Outputs and artifacts (downloaded from remote for inspection)
+outputs/
+renders/
+.vlm_cache/
+
+# Large mesh data that shouldn't be versioned
+*.glb
+*.gltf
+*.fbx
+*.obj
+*.ply
+*.stl
+
+# Whitelist the example outputs under examples/
+!examples/**/*.ply
+!examples/**/*.png
+!examples/**/*.json
+
+# Editor stuff
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# Env-specific
+.env
+*.log
+
+# Benchmark raw data too big to version
+outputs/benchmark/

@@ -1,0 +1,43 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ultrashape-cleaning-replica"
+version = "0.1.0"
+description = "Open-source replica of the UltraShape 1.0 data-cleaning pipeline (arXiv 2512.21185)"
+readme = "README.md"
+license = {file = "LICENSE"}
+authors = [{name = "ultrashape-cleaning-replica contributors"}]
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "scipy>=1.11",
+    "scikit-image>=0.22",
+    "trimesh>=4.4",
+    "Pillow>=10.0",
+    "omegaconf>=2.3",
+    # torch, cubvh, pytorch-lightning, transformers are environment-specific.
+]
+
+[project.optional-dependencies]
+vlm = [
+    "transformers>=4.57.0",
+]
+ultrashape = [
+    "pytorch-lightning>=2.0",
+]
+test = [
+    "pytest>=7.0",
+]
+
+[project.urls]
+"Paper" = "https://arxiv.org/abs/2512.21185"
+"Repository" = "https://github.com/<user>/ultrashape-cleaning-replica"
+
+[tool.setuptools.packages.find]
+include = ["ultrashape_cleaning*"]
+
+[project.scripts]
+ultrashape-clean = "ultrashape_cleaning.clean_mesh:main"
+ultrashape-batch-clean = "ultrashape_cleaning.batch_clean:main"
