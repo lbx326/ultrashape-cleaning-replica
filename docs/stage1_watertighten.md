@@ -19,7 +19,9 @@ The implementation is closed-source.
 
 ## What we ship
 
-A three-backend pipeline living in `ultrashape_cleaning/watertighten.py`.
+A **dense 1024³** pipeline living in `ultrashape_cleaning/watertighten.py`.
+We do NOT ship the paper's sparse-tensor 2048³ path; the concession box
+at the bottom of this file and `docs/concessions.md` §1 explain why.
 The main algorithm path is:
 
 ```
@@ -51,12 +53,14 @@ largest-component filter + normal/winding fix
 
 - **Voxelization**: `voxelize_shell_cubvh` queries `cubvh.unsigned_distance`
   at every voxel center and thresholds at `band_voxels / R` voxel widths.
-  This is equivalent to the exact triangle-voxel intersection test but
-  runs entirely on GPU. We chunk the queries to 4M points at a time to
-  cap VRAM; at 1024³ this peaks at about **24 GB** on an A100-80GB.
-  The 2048³ path needs ~192 GB peak and is gated behind a future
-  coarse-to-fine ROI refinement (not yet productionized — see
-  "Concessions" below).
+  This approximates the exact triangle-voxel intersection test (exact up
+  to the band width — triangles that graze a voxel corner outside the
+  band can be missed), and runs entirely on GPU. We chunk the queries to
+  4M points at a time to cap VRAM; at 1024³ this peaks at about **24 GB**
+  on an A100-80GB. The 2048³ path needs ~192 GB peak and is gated behind
+  a future coarse-to-fine ROI refinement (**not yet implemented** — see
+  "Concessions" below). The implementation is fully DENSE; the paper's
+  sparse COO representation is not reproduced here.
 
 - **Watershed-like flood-fill**: We implement the flood as iterative
   26-connected dilation using `F.max_pool3d(3, stride=1, padding=1)`.
@@ -106,12 +110,17 @@ anyway.
 
 ## Concessions vs the paper
 
-1. **No 2048³ dense path.** Dense fp32 at 2048³ is 32 GB per volume;
-   running cubvh distance queries on 8.5 billion points in 4M-point
-   chunks would take ~15 minutes per mesh. A sparse-tensor + hash-map
-   representation would be required to match the paper's throughput.
-   We stub this as `WatertightenConfig.coarse_to_fine=True` with
-   resolution=2048 and dense_resolution=512; currently not implemented.
+1. **Dense 1024³, not sparse 2048³.** The paper's sparse COO / CUDA
+   kernel for 2048³ is not implemented. We run fully dense at 1024³.
+   Dense fp32 at 2048³ would be 32 GB per volume and cubvh distance
+   queries on 8.5 billion points in 4M-point chunks would take ~15
+   minutes per mesh; matching the paper's throughput requires a sparse
+   representation (e.g. fVDB / OpenVDB) that we do not ship. The
+   `WatertightenConfig.coarse_to_fine` flag is reserved for a future
+   coarse-512³-dense + fine-2048³-ROI implementation; it is currently
+   a **no-op** (the code does not branch on it). The module docstring
+   used to claim "sparse COO" storage — that was aspirational; the
+   implementation is and has always been dense.
 
 2. **Watershed inspired, not exact.** The paper's description ("watershed-
    inspired") doesn't commit to a specific segmentation algorithm. We

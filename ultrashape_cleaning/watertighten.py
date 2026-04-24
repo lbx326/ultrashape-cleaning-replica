@@ -2,19 +2,21 @@
 
 Replicates (to the extent open-source tools allow) the paper's 2048^3
 CUDA-parallel sparse-voxel watertightener described in UltraShape 1.0
-§2.1. The paper's exact kernel is closed source; we approximate it with:
+§2.1. The paper's exact kernel is closed source; this implementation
+uses a **dense fp32 1024^3 volume** (not the paper's sparse 2048^3):
 
-    - GPU triangle voxelization at 1024^3 (coarse) → 2048^3 (fine near
-      the shell) using PyTorch + cubvh's signed-distance kernel, storing
-      occupied voxels in a torch sparse COO tensor.
-    - Watershed-inspired hole closing: flood-fill from the grid boundary
-      on GPU (iterative 6-connected label propagation on a dense
-      {exterior, unknown, shell} volume), stopping at the shell.
+    - GPU triangle voxelization at 1024^3 via PyTorch + cubvh's
+      unsigned-distance kernel. Shell cells are those with distance
+      below one voxel width.
+    - Watershed-inspired hole closing: morphological closing (dilation
+      + erosion) then flood-fill from the grid boundary on GPU
+      (iterative 26-connected label propagation via ``max_pool3d``).
     - Adaptive volumetric thickening for open shells. Detects openness
-      via ray-escape ratio from interior candidate points; thickens
-      along outward normals by running cubvh.signed_distance and then
-      evaluating points with |SDF| < epsilon.
-    - True SDF via cubvh.signed_distance evaluated at the dense grid.
+      via ray-escape ratio from interior voxels; thickens the shell
+      along outward normals and re-runs the flood-fill.
+    - True SDF via cubvh.signed_distance evaluated at every voxel
+      center, sign-corrected from the flood-fill occupancy to survive
+      broken input winding.
     - Marching cubes at level 0 via skimage.measure.marching_cubes.
 
 The output is a single 2-manifold, watertight mesh in the SAME world
@@ -22,16 +24,18 @@ coordinates as the input (we unscale at the very end).
 
 Design notes
 -------------
-We use a dense volume (not sparse) for the final SDF because scikit-image's
-marching_cubes expects dense np arrays and running MC at 2048^3 dense (32 GB
-fp32) would OOM — we instead run at 1024^3 dense (4 GB fp32) which fits
-comfortably on an A100-80GB alongside cubvh. We ALSO support 512^3 and
-768^3 for development iteration.
+We use a dense fp32 volume because scikit-image's ``marching_cubes``
+expects dense np arrays and a sparse COO representation would need a
+custom MC implementation. At 1024^3 a single fp32 volume is 4 GB; peak
+memory with the shell / occupancy / SDF all resident is ~10 GB which
+fits comfortably on an A100-80GB alongside cubvh's BVH. 512^3 and 768^3
+are supported for development iteration.
 
-The 2048^3 path stays in coarse-to-fine mode: coarse 512^3 dense flood-fill
-to localise the outside region; then cubvh.signed_distance evaluated on a
-ROI near the shell at 2048^3 effective pitch, and marching cubes run on
-that ROI block.
+A true sparse-tensor 2048^3 path (matching the paper) would need either
+``fVDB`` / OpenVDB bindings or a custom CUDA kernel, and a sparse MC
+implementation. ``WatertightenConfig.coarse_to_fine`` is reserved for a
+future coarse-512^3-dense + fine-2048^3-ROI implementation; it is
+currently a no-op — see ``docs/concessions.md`` §1.
 """
 from __future__ import annotations
 
@@ -473,12 +477,16 @@ def watertighten_mesh(
     ray_escape = None
     if inside_frac_raw < cfg.open_shell_threshold:
         # Classical sign: flood fill barely found any interior, so the shell
-        # is either very thin or has holes. Do a ray-escape test on the shell
-        # voxels themselves (we still want a sanity number).
-        # Use all shell cells as origins.
+        # is either very thin or has holes. Shoot rays from true INTERIOR
+        # voxels (found by flood-fill) — not shell voxels — so the first
+        # hit tests whether an interior point can see the outside, not
+        # whether it is sitting inside a triangle. Falling back to shell
+        # voxels when there is no interior at all is the previous
+        # (conservative) behaviour.
         try:
+            origin_vol = inside_raw if inside_raw.any() else closed_shell
             ray_escape = _ray_escape_fraction(
-                mesh_fit, closed_shell, cfg.ray_escape_samples, cfg.device
+                mesh_fit, origin_vol, cfg.ray_escape_samples, cfg.device
             )
             open_shell_detected = ray_escape > cfg.ray_escape_thresh
         except Exception as e:
@@ -552,7 +560,16 @@ def watertighten_mesh(
         mesh_out = largest_component(mesh_out)
 
     mesh_out.merge_vertices()
-    mesh_out.remove_duplicate_faces()
+    # trimesh >= 4.0 removed ``remove_duplicate_faces`` in favour of
+    # ``update_faces(unique_faces())``. The constructor's ``process=True``
+    # already dedupes, but an MC output fed through ``largest_component``
+    # may reintroduce duplicates; we keep the explicit call for safety.
+    try:
+        mesh_out.update_faces(mesh_out.unique_faces())
+    except AttributeError:
+        # Older trimesh (<4.0) fallback.
+        if hasattr(mesh_out, "remove_duplicate_faces"):
+            mesh_out.remove_duplicate_faces()
     mesh_out.fix_normals()
 
     # 11. Final report.
@@ -585,11 +602,19 @@ def watertighten_mesh(
     )
 
     if verbose:
-        print(f"[stage1] OUT: {len(mesh_out.vertices)} V, "
-              f"{len(mesh_out.faces)} F, watertight={mesh_out.is_watertight}, "
-              f"chamfer={cham:.5f}" if cham is not None else
-              f"[stage1] OUT: {len(mesh_out.vertices)} V, "
-              f"{len(mesh_out.faces)} F, watertight={mesh_out.is_watertight}")
+        # NB: Python's conditional expression has lower precedence than
+        # ``+`` so ``print(A + B if C else D)`` parses as
+        # ``print(A + (B if C else D))`` — the previous implementation
+        # raised ``TypeError`` when ``cham`` was ``None``. Build the
+        # message string explicitly before printing.
+        base_msg = (f"[stage1] OUT: {len(mesh_out.vertices)} V, "
+                    f"{len(mesh_out.faces)} F, "
+                    f"watertight={mesh_out.is_watertight}")
+        if cham is not None:
+            msg = f"{base_msg}, chamfer={cham:.5f}"
+        else:
+            msg = base_msg
+        print(msg)
         print(f"[stage1] total {seconds_total:.2f}s")
 
     return mesh_out, sdf_np, report

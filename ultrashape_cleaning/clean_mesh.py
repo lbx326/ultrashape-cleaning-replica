@@ -47,6 +47,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from . import _config
 from ._meshio import PathLike, load_mesh, save_mesh, sha256_file, summarize
 
 
@@ -75,17 +76,35 @@ class PipelineConfig:
     skip_canonicalize: bool = False
     skip_stage4: bool = False
     device: str = "cuda"
-    vlm_model_path: str = "/moganshan/afs_a/anmt/action/Qwen3-VL/Qwen3-VL-8B-Instruct/"
-    vae_ckpt_path: str = ("/moganshan/afs_a/lbx/hf/hub/models--infinith--UltraShape/"
-                          "snapshots/5aeb21a7185d39f042d02b2695802f125a6f5159/"
-                          "ultrashape_v1.pt")
-    vae_config_path: str = "/moganshan/afs_a/lbx/workspace/UltraShape-1.0/configs/infer_dit_refine.yaml"
+    # Paths default to env vars (QWEN3VL_MODEL_PATH, ULTRASHAPE_VAE_CKPT,
+    # ULTRASHAPE_VAE_CONFIG, VLM_PYTHON_EXE) so clones can run without
+    # editing source. See ``_config.py`` for the full list.
+    vlm_model_path: str = dataclasses.field(
+        default_factory=_config.get_qwen3vl_model_path,
+    )
+    vae_ckpt_path: Optional[str] = dataclasses.field(
+        default_factory=_config.get_vae_ckpt_path,
+    )
+    vae_config_path: Optional[str] = dataclasses.field(
+        default_factory=_config.get_vae_config_path,
+    )
     vlm_cache_dir: Optional[str] = None
     # When the VLM needs a different env (e.g. transformers 4.57 for
     # Qwen3-VL) than the rest of the pipeline, we shell out to a sidecar
-    # python interpreter for Stage 2.
-    vlm_python_exe: Optional[str] = "/moganshan/afs_a/lbx/env/buildingseg/bin/python"
-    vlm_sidecar_visible_devices: Optional[str] = None  # "7" etc
+    # python interpreter for Stage 2. When unset, Stage 2 runs in-process
+    # (requires transformers 4.57+ in the current env).
+    vlm_python_exe: Optional[str] = dataclasses.field(
+        default_factory=_config.get_vlm_python_exe,
+    )
+    vlm_sidecar_visible_devices: Optional[str] = dataclasses.field(
+        default_factory=_config.get_vlm_sidecar_cuda_visible_devices,
+    )
+    # Working directory for the Stage 2 sidecar. Defaults to the repo
+    # root (where ``python -m ultrashape_cleaning.vlm_filter`` resolves
+    # the package from). Override via VLM_SIDECAR_CWD.
+    vlm_sidecar_cwd: str = dataclasses.field(
+        default_factory=_config.get_vlm_sidecar_cwd,
+    )
 
 
 @dataclasses.dataclass
@@ -118,6 +137,16 @@ class _ClientCache:
 _CACHE = _ClientCache()
 
 
+def _default_render_dir() -> Path:
+    """Platform-appropriate fallback directory for intermediate renders.
+
+    The original implementation hard-coded ``/tmp/mesh_clean`` which only
+    exists on Linux. We fall back to the OS-standard tempdir.
+    """
+    import tempfile
+    return Path(tempfile.gettempdir()) / "ultrashape_cleaning"
+
+
 # ---------------------------------------------------------------------------
 # Pipeline function
 # ---------------------------------------------------------------------------
@@ -127,6 +156,7 @@ def clean_mesh_pipeline(
     cfg: Optional[PipelineConfig] = None,
     vae=None,
     vlm_client=None,
+    vlm_daemon=None,
     render_dir: Optional[PathLike] = None,
     verbose: bool = True,
 ) -> CleanResult:
@@ -184,7 +214,8 @@ def clean_mesh_pipeline(
             vlm_client = _CACHE.vlm
         temp_png = None
         if need_vlm_client:
-            render_dir = Path(render_dir) if render_dir else Path("/tmp/mesh_clean")
+            render_dir = (Path(render_dir) if render_dir
+                          else _default_render_dir())
             render_dir.mkdir(parents=True, exist_ok=True)
             temp_png = render_dir / f"{sha}.6view.png"
         mesh_canon, R, rep3 = canonicalize_mesh(
@@ -223,20 +254,12 @@ def clean_mesh_pipeline(
             vae_config_path=cfg.vae_config_path,
             vae_ckpt_path=cfg.vae_ckpt_path,
         )
-        # Stage 1 already gave us an SDF and a known flood-fill sign. Use it
-        # as the ground-truth-inside function so Stage 4 doesn't redo the
-        # multi-bounce ray cast.
-        def _gt_from_sdf(pts_np):
-            import numpy as _np
-            # Canonicalization rotates verts; also re-fit. The sdf is in the
-            # watertighten's [0,1]^3 unit cube for the ORIGINAL mesh. We
-            # need to transform test points back. Since canonicalization
-            # operates AFTER watertighten, and Stage 4 runs on the
-            # canonical mesh, sdf is not directly reusable. Skip the
-            # optimization and fall back to ray-cast GT.
-            return None
-        # Use a cheaper ray-cast: single ray per point (parity trick works
-        # on watertight mesh).
+        # The Stage 1 SDF lives in the [0,1]^3 unit cube of the ORIGINAL
+        # (un-canonicalized) mesh; re-using it after canonicalization
+        # would require round-tripping test points through two affine
+        # transforms. Stage 4 instead falls back to the cheaper
+        # Jordan-curve parity GT via a single-ray-per-point cast on the
+        # already-watertight canonical mesh.
         rep4 = filter_geometry(mesh_canon, fcfg, vae=vae, verbose=verbose)
         timings["stage4_filter_geometry"] = time.time() - t
         reports["stage4_filter_geometry"] = dataclasses.asdict(rep4)
@@ -249,7 +272,8 @@ def clean_mesh_pipeline(
     else:
         t = time.time()
         # We always need to render the grid in-process (we have cubvh here).
-        render_dir = Path(render_dir) if render_dir else Path("/tmp/mesh_clean")
+        render_dir = (Path(render_dir) if render_dir
+                      else _default_render_dir())
         render_dir.mkdir(parents=True, exist_ok=True)
         grid_png = render_dir / f"{sha}.grid.png"
         from .renderer import render_four_views, make_2x2_grid
@@ -261,7 +285,42 @@ def clean_mesh_pipeline(
         Image.fromarray(grid).save(str(grid_png))
 
         # Run inference:
-        if cfg.vlm_python_exe:
+        if vlm_daemon is not None:
+            # Persistent sidecar: amortises the ~60 s Qwen3-VL model load
+            # across many meshes. ``vlm_daemon`` is a
+            # :class:`ultrashape_cleaning.batch_clean.VLMDaemonClient` (or
+            # any object with a compatible ``.infer(...)`` method).
+            vlm_json = render_dir / f"{sha}.vlm.json"
+            if verbose:
+                print("[pipeline] daemon VLM: sending request")
+            try:
+                resp = vlm_daemon.infer(
+                    grid_png=str(grid_png),
+                    mesh_id=sha,
+                    out_json=str(vlm_json),
+                    cache_dir=cfg.vlm_cache_dir,
+                    prompt_lang=cfg.vlm_prompt_lang,
+                )
+                if resp.get("ok"):
+                    vlm_data = resp["result"]
+                    reports["stage2_vlm_filter"] = vlm_data
+                    if not vlm_data.get("accepted", True):
+                        reasons.extend(
+                            f"stage2:{r}" for r in
+                            vlm_data.get("rejection_reasons", [])
+                        )
+                else:
+                    reports["stage2_vlm_filter"] = {
+                        "error": "daemon_failed",
+                        "detail": resp.get("error"),
+                        "traceback": resp.get("traceback"),
+                    }
+            except Exception as e:
+                reports["stage2_vlm_filter"] = {
+                    "error": f"daemon_exception:{type(e).__name__}",
+                    "detail": str(e),
+                }
+        elif cfg.vlm_python_exe:
             # Sidecar subprocess in the other env.
             import subprocess, os
             vlm_json = render_dir / f"{sha}.vlm.json"
@@ -282,7 +341,7 @@ def clean_mesh_pipeline(
                 print(f"[pipeline] sidecar VLM: {' '.join(cmd[:3])}...")
             proc = subprocess.run(
                 cmd, capture_output=True, text=True, env=env,
-                cwd="/moganshan/afs_a/lbx/utils/mesh_clean",
+                cwd=cfg.vlm_sidecar_cwd,
             )
             if proc.returncode != 0:
                 reports["stage2_vlm_filter"] = {

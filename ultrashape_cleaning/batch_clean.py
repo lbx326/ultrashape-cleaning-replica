@@ -35,17 +35,52 @@ import time
 from pathlib import Path
 from typing import Optional
 
+from . import _config
 from .clean_mesh import CleanResult, PipelineConfig, clean_mesh_pipeline
 
 
-class VLMDaemonClient:
-    """Persistent subprocess that keeps Qwen3-VL loaded between meshes."""
+class VLMDaemonReadyError(RuntimeError):
+    """Raised when the Stage 2 sidecar fails to send a ``{"ready": true}``
+    line on startup (e.g. torch/transformers ImportError in the sidecar
+    env). Callers can fall back to the per-mesh subprocess path."""
 
-    def __init__(self, python_exe: str, model_path: str, device: str = "cuda",
-                 cwd: str = "/moganshan/afs_a/lbx/utils/mesh_clean",
-                 cuda_visible_devices: Optional[str] = None):
-        import subprocess, os, json as _json
+
+class VLMDaemonClient:
+    """Persistent subprocess that keeps Qwen3-VL loaded between meshes.
+
+    Spawns ``python -m ultrashape_cleaning.vlm_filter serve`` and speaks
+    the JSONL protocol defined in ``vlm_filter._cli_serve``. Reuse
+    a single instance across a batch to amortise the ~60 s model load.
+
+    Parameters
+    ----------
+    python_exe
+        Path to the sidecar interpreter (env: ``VLM_PYTHON_EXE``).
+    model_path
+        Qwen3-VL model directory or HuggingFace id (env:
+        ``QWEN3VL_MODEL_PATH``).
+    device
+        Passed through to the model.
+    cwd
+        Working directory for the subprocess. Must contain the
+        ``ultrashape_cleaning`` package on ``sys.path`` (defaults to the
+        repo root via ``VLM_SIDECAR_CWD``).
+    cuda_visible_devices
+        Propagated to the sidecar's environment if set.
+    ready_timeout
+        Seconds to wait for the ``{"ready": true}`` handshake before
+        raising ``VLMDaemonReadyError``.
+    """
+
+    def __init__(self, python_exe: str, model_path: Optional[str] = None,
+                 device: str = "cuda",
+                 cwd: Optional[str] = None,
+                 cuda_visible_devices: Optional[str] = None,
+                 ready_timeout: float = 600.0):
+        import subprocess, os, json as _json, threading
         self._json = _json
+        model_path = model_path or _config.get_qwen3vl_model_path()
+        cwd = cwd or _config.get_vlm_sidecar_cwd()
         env = os.environ.copy()
         if cuda_visible_devices is not None:
             env["CUDA_VISIBLE_DEVICES"] = cuda_visible_devices
@@ -55,20 +90,89 @@ class VLMDaemonClient:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=env, cwd=cwd, bufsize=1,
         )
-        # Wait for "ready".
-        line = self.proc.stdout.readline().strip()
-        info = self._json.loads(line) if line else {}
-        self.ready = info.get("ready", False)
-        self.model_name = info.get("model")
+        # Wait for "ready" with a timeout. If the subprocess dies before
+        # printing the ready line (e.g. missing transformers dep), the
+        # plain ``readline()`` from the review hung forever — gate it
+        # behind a background thread + timer.
+        line_container: list = []
 
-    def infer(self, grid_png: str, mesh_id: str, out_json: str,
-              cache_dir: Optional[str] = None, prompt_lang: str = "en") -> dict:
+        def _read_line():
+            try:
+                line_container.append(self.proc.stdout.readline())
+            except Exception:
+                line_container.append("")
+
+        t = threading.Thread(target=_read_line, daemon=True)
+        t.start()
+        t.join(timeout=ready_timeout)
+        if t.is_alive() or not line_container:
+            self._kill()
+            raise VLMDaemonReadyError(
+                f"VLM sidecar did not report ready within {ready_timeout}s"
+            )
+        line = (line_container[0] or "").strip()
+        if not line:
+            # Subprocess exited; read stderr for diagnostic.
+            try:
+                stderr = self.proc.stderr.read()[-500:]
+            except Exception:
+                stderr = ""
+            self._kill()
+            raise VLMDaemonReadyError(
+                f"VLM sidecar exited before reporting ready. stderr tail: "
+                f"{stderr}"
+            )
+        try:
+            info = self._json.loads(line)
+        except Exception as e:
+            self._kill()
+            raise VLMDaemonReadyError(
+                f"VLM sidecar ready-line was not JSON: {line!r} ({e})"
+            )
+        self.ready = bool(info.get("ready", False))
+        self.model_name = info.get("model")
+        if not self.ready:
+            self._kill()
+            raise VLMDaemonReadyError(f"VLM sidecar ready=False: {info}")
+
+    def infer(self, grid_png: str, mesh_id: str, out_json: Optional[str] = None,
+              cache_dir: Optional[str] = None, prompt_lang: str = "en",
+              timeout: float = 300.0) -> dict:
+        import threading
         req = {"grid": grid_png, "mesh_id": mesh_id, "out_json": out_json,
                "cache_dir": cache_dir, "prompt_lang": prompt_lang}
         self.proc.stdin.write(self._json.dumps(req) + "\n")
         self.proc.stdin.flush()
-        line = self.proc.stdout.readline()
+        # Guard against a crashed daemon: reading without a timeout will
+        # block forever on a dead pipe.
+        line_container: list = []
+
+        def _read_line():
+            try:
+                line_container.append(self.proc.stdout.readline())
+            except Exception:
+                line_container.append("")
+
+        t = threading.Thread(target=_read_line, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive() or not line_container:
+            raise TimeoutError(
+                f"VLM sidecar did not respond within {timeout}s for "
+                f"mesh_id={mesh_id}"
+            )
+        line = line_container[0]
+        if not line:
+            raise RuntimeError(
+                f"VLM sidecar closed stdout while processing {mesh_id}"
+            )
         return self._json.loads(line)
+
+    def _kill(self):
+        try:
+            self.proc.kill()
+        except Exception:
+            pass
 
     def close(self):
         try:
@@ -76,7 +180,13 @@ class VLMDaemonClient:
             self.proc.stdin.flush()
             self.proc.wait(timeout=30)
         except Exception:
-            self.proc.kill()
+            self._kill()
+
+    def __enter__(self) -> "VLMDaemonClient":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> None:
+        self.close()
 
 
 def _collect_meshes(input_dir: Path, patterns: list[str]) -> list[Path]:
@@ -94,7 +204,16 @@ def batch_clean(
     cfg: Optional[PipelineConfig] = None,
     summary_csv: Optional[Path] = None,
     verbose: bool = True,
+    use_vlm_daemon: bool = True,
 ) -> list[CleanResult]:
+    """Run :func:`clean_mesh_pipeline` on every mesh in ``input_paths``.
+
+    When ``use_vlm_daemon`` is true and ``cfg.vlm_python_exe`` is set, a
+    single :class:`VLMDaemonClient` subprocess is spawned for the entire
+    batch, amortising the ~60 s Qwen3-VL model-load cost across every
+    mesh. Falls back to per-mesh sidecar subprocesses if the daemon
+    cannot be started.
+    """
     cfg = cfg or PipelineConfig()
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -103,66 +222,97 @@ def batch_clean(
     render_dir = Path(render_dir) if render_dir else output_dir / "renders"
     render_dir.mkdir(parents=True, exist_ok=True)
 
+    # Spin up a persistent VLM daemon if one is available. When the env
+    # var ``VLM_PYTHON_EXE`` (or ``cfg.vlm_python_exe``) is set we assume
+    # the caller wants Stage 2 to run in a different interpreter; with
+    # the daemon we do it once per batch instead of once per mesh.
+    vlm_daemon: Optional[VLMDaemonClient] = None
+    if (use_vlm_daemon and cfg.vlm_python_exe
+            and not cfg.skip_vlm):
+        try:
+            if verbose:
+                print(f"[batch] starting VLM daemon "
+                      f"({cfg.vlm_python_exe})")
+            vlm_daemon = VLMDaemonClient(
+                python_exe=cfg.vlm_python_exe,
+                model_path=cfg.vlm_model_path,
+                device=cfg.device,
+                cwd=cfg.vlm_sidecar_cwd,
+                cuda_visible_devices=cfg.vlm_sidecar_visible_devices,
+            )
+            if verbose:
+                print(f"[batch] VLM daemon ready ({vlm_daemon.model_name})")
+        except VLMDaemonReadyError as e:
+            if verbose:
+                print(f"[batch] VLM daemon unavailable: {e}. "
+                      f"Falling back to per-mesh subprocess.")
+            vlm_daemon = None
+
     results: list[CleanResult] = []
     csv_rows: list[dict] = []
 
-    for i, input_path in enumerate(input_paths):
-        out_ply = output_dir / (input_path.stem + ".ply")
-        report_json = report_dir / (input_path.stem + ".json")
-        t0 = time.time()
-        try:
-            res = clean_mesh_pipeline(
-                input_path=input_path,
-                output_path=out_ply,
-                cfg=cfg,
-                render_dir=render_dir,
-                verbose=verbose,
-            )
-            report_json.write_text(res.to_json(), encoding="utf-8")
-            results.append(res)
-            if verbose:
-                print(f"[batch] [{i+1}/{len(input_paths)}] "
-                      f"{input_path.name} {res.seconds_total:.1f}s "
-                      f"accepted={res.accepted}")
-            csv_rows.append({
-                "input": str(input_path),
-                "output": str(out_ply),
-                "accepted": int(res.accepted),
-                "reasons": "|".join(res.rejection_reasons),
-                "total_s": round(res.seconds_total, 2),
-                "s1_watertight": res.stage_reports.get(
-                    "stage1_watertighten", {}).get("is_watertight"),
-                "s1_chamfer": res.stage_reports.get(
-                    "stage1_watertighten", {}).get("chamfer_to_input"),
-                "s2_quality": res.stage_reports.get(
-                    "stage2_vlm_filter", {}).get("aesthetic_quality"),
-                "s2_class": res.stage_reports.get(
-                    "stage2_vlm_filter", {}).get("object_class"),
-                "s4_ray_agreement": (res.stage_reports.get(
-                    "stage4_filter_geometry", {}).get("metrics", {})
-                    .get("ray_sign_agreement")),
-                "s4_vae_chamfer": (res.stage_reports.get(
-                    "stage4_filter_geometry", {}).get("metrics", {})
-                    .get("vae", {}) or {}).get("chamfer"),
-            })
-        except Exception as e:
-            import traceback
-            traceback.print_exc()
-            if verbose:
-                print(f"[batch] ERROR on {input_path.name}: {e}")
-            csv_rows.append({
-                "input": str(input_path),
-                "output": "",
-                "accepted": 0,
-                "reasons": f"exception:{type(e).__name__}:{str(e)[:200]}",
-                "total_s": round(time.time() - t0, 2),
-                "s1_watertight": None,
-                "s1_chamfer": None,
-                "s2_quality": None,
-                "s2_class": None,
-                "s4_ray_agreement": None,
-                "s4_vae_chamfer": None,
-            })
+    try:
+        for i, input_path in enumerate(input_paths):
+            out_ply = output_dir / (input_path.stem + ".ply")
+            report_json = report_dir / (input_path.stem + ".json")
+            t0 = time.time()
+            try:
+                res = clean_mesh_pipeline(
+                    input_path=input_path,
+                    output_path=out_ply,
+                    cfg=cfg,
+                    vlm_daemon=vlm_daemon,
+                    render_dir=render_dir,
+                    verbose=verbose,
+                )
+                report_json.write_text(res.to_json(), encoding="utf-8")
+                results.append(res)
+                if verbose:
+                    print(f"[batch] [{i+1}/{len(input_paths)}] "
+                          f"{input_path.name} {res.seconds_total:.1f}s "
+                          f"accepted={res.accepted}")
+                csv_rows.append({
+                    "input": str(input_path),
+                    "output": str(out_ply),
+                    "accepted": int(res.accepted),
+                    "reasons": "|".join(res.rejection_reasons),
+                    "total_s": round(res.seconds_total, 2),
+                    "s1_watertight": res.stage_reports.get(
+                        "stage1_watertighten", {}).get("is_watertight"),
+                    "s1_chamfer": res.stage_reports.get(
+                        "stage1_watertighten", {}).get("chamfer_to_input"),
+                    "s2_quality": res.stage_reports.get(
+                        "stage2_vlm_filter", {}).get("aesthetic_quality"),
+                    "s2_class": res.stage_reports.get(
+                        "stage2_vlm_filter", {}).get("object_class"),
+                    "s4_ray_agreement": (res.stage_reports.get(
+                        "stage4_filter_geometry", {}).get("metrics", {})
+                        .get("ray_sign_agreement")),
+                    "s4_vae_chamfer": (res.stage_reports.get(
+                        "stage4_filter_geometry", {}).get("metrics", {})
+                        .get("vae", {}) or {}).get("chamfer"),
+                })
+            except Exception as e:
+                import traceback
+                traceback.print_exc()
+                if verbose:
+                    print(f"[batch] ERROR on {input_path.name}: {e}")
+                csv_rows.append({
+                    "input": str(input_path),
+                    "output": "",
+                    "accepted": 0,
+                    "reasons": f"exception:{type(e).__name__}:{str(e)[:200]}",
+                    "total_s": round(time.time() - t0, 2),
+                    "s1_watertight": None,
+                    "s1_chamfer": None,
+                    "s2_quality": None,
+                    "s2_class": None,
+                    "s4_ray_agreement": None,
+                    "s4_vae_chamfer": None,
+                })
+    finally:
+        if vlm_daemon is not None:
+            vlm_daemon.close()
 
     if summary_csv:
         summary_csv = Path(summary_csv)

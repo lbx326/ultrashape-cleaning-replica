@@ -57,6 +57,7 @@ from typing import Optional
 
 import numpy as np
 
+from . import _config
 from ._meshio import PathLike, sha256_file
 
 
@@ -302,9 +303,15 @@ class Qwen3VLClient:
         self.model_name = os.path.basename(str(model_path).rstrip("/"))
 
     @classmethod
-    def from_local(cls, path: str = "/moganshan/afs_a/anmt/action/Qwen3-VL/"
-                                     "Qwen3-VL-8B-Instruct/",
+    def from_local(cls, path: Optional[str] = None,
                    **kwargs) -> "Qwen3VLClient":
+        """Load a Qwen3-VL client.
+
+        ``path`` defaults to the ``QWEN3VL_MODEL_PATH`` environment variable
+        (falling back to the HuggingFace hub id ``Qwen/Qwen3-VL-8B-Instruct``).
+        """
+        if path is None:
+            path = _config.get_qwen3vl_model_path()
         return cls(path, **kwargs)
 
     def generate(
@@ -527,8 +534,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     pi.add_argument("--out-json", type=Path, required=True)
     pi.add_argument("--cache-dir", type=Path, default=None)
     pi.add_argument("--model-path",
-                    default="/moganshan/afs_a/anmt/action/Qwen3-VL/"
-                            "Qwen3-VL-8B-Instruct/")
+                    default=_config.get_qwen3vl_model_path(),
+                    help="Qwen3-VL model dir or HF id "
+                         "(env: QWEN3VL_MODEL_PATH)")
     pi.add_argument("--prompt-lang", choices=["en", "zh"], default="en")
     pi.add_argument("--device", default="cuda")
     pi.add_argument("--dtype", default="bfloat16")
@@ -539,8 +547,9 @@ def main(argv: Optional[list[str]] = None) -> int:
     # serve (daemon)
     ps = sub.add_parser("serve", help="Persistent JSONL daemon mode")
     ps.add_argument("--model-path",
-                    default="/moganshan/afs_a/anmt/action/Qwen3-VL/"
-                            "Qwen3-VL-8B-Instruct/")
+                    default=_config.get_qwen3vl_model_path(),
+                    help="Qwen3-VL model dir or HF id "
+                         "(env: QWEN3VL_MODEL_PATH)")
     ps.add_argument("--device", default="cuda")
     ps.add_argument("--dtype", default="bfloat16")
     ps.add_argument("--attn-impl", default=None)

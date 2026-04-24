@@ -9,7 +9,11 @@ UltraShape 1.0's closed-source data-cleaning pipeline, and why.
 kernel.
 
 **Ours**: 1024³ effective resolution via `cubvh.unsigned_distance` +
-dense fp32 occupancy volume.
+**dense fp32** occupancy volume. The implementation is dense at every
+stage (shell, closed shell, outside, occupancy, SDF). The module
+docstring previously mentioned "sparse COO tensor" storage — that was
+aspirational wording and did not match the code; the docstring has been
+corrected.
 
 **Why we can't match**:
 - A dense fp32 volume at 2048³ is **32 GB** per copy, and the pipeline
@@ -28,8 +32,9 @@ of HSSD / Objaverse GLBs, so the quality gap is small in practice.
 **Future work**: coarse-to-fine ROI refinement. Run 512³ dense flood-
 fill for overall occupancy; then run `cubvh.signed_distance` at 2048³
 only within 4 voxels of the shell (`sdf_band_voxels=4`); marching cubes
-operates on the sparse SDF band. We stub this in
-`WatertightenConfig.coarse_to_fine=True` but it is not implemented.
+operates on the sparse SDF band. ``WatertightenConfig.coarse_to_fine``
+is reserved for this; the flag exists but the current code does **not**
+branch on it, i.e. it is a **no-op**, not an "opt-in" path.
 
 ## 2. Watershed hole closing — simplified to dilation-based
 
@@ -106,11 +111,14 @@ subprocess.run([cfg.vlm_python_exe, "-m", "ultrashape_cleaning.vlm_filter",
                 "infer", ...])
 ```
 
-This adds ~5 s per mesh to subprocess overhead (spinning up torch +
-transformers). For batch runs, the VLM model is cached to disk via the
-chat-template import; the first call's 60 s model-load is one-shot but
-**subsequent subprocess calls re-pay that cost per mesh**. A persistent
-server mode (Stage 2 daemon) is a natural extension.
+For **single-mesh** runs (`clean_mesh.py`) the subprocess reloads the
+model each time, costing ~60 s per call. For **batch** runs
+(`batch_clean.py`) we now spawn a single persistent ``VLMDaemonClient``
+at the start of the batch (env var ``VLM_PYTHON_EXE``), keep the model
+resident across all meshes, and tear it down when the batch ends. This
+drops per-mesh VLM cost to ~8 s. The daemon speaks a JSONL protocol
+defined in ``vlm_filter.py::_cli_serve``; see ``batch_clean.py``
+(``batch_clean`` function) for the plumbing.
 
 ## 7. No training-distribution calibration
 

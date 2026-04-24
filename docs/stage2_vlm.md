@@ -117,9 +117,9 @@ transformers 4.57 into ultrashape).
 
 1. **Which VLM** — the paper doesn't specify. Qwen3-VL-8B is a strong
    choice: open-weights, robust on structured JSON, good zero-shot object
-   recognition. Qwen3-VL-32B is available at
-   `/moganshan/afs_a/lbx/hf/hub/models--Qwen--Qwen3-VL-32B-Instruct/`
-   and can be swapped in by passing `--model-path`.
+   recognition. Qwen3-VL-32B (``Qwen/Qwen3-VL-32B-Instruct`` on
+   HuggingFace) can be swapped in by setting ``QWEN3VL_MODEL_PATH`` or
+   passing ``--model-path`` at a small cost in latency (~2× slower).
 
 2. **No fine-tuning.** The paper hints at fine-tuned VLMs for quality
    scoring. We use zero-shot prompting, which works well in practice but

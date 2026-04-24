@@ -48,45 +48,60 @@ accepted). VLM classified the sample as: bed, chandelier, vase,
 orchid, chair, cabinet, appliance, box — recognizable furniture and
 props.
 
-**Stage 2 VLM subprocess overhead (60-90 s model load per mesh in
-batch mode) is fixable**: ship the persistent `vlm_filter serve`
-daemon (already implemented; see `batch_clean.py::VLMDaemonClient`).
-With the daemon the per-mesh VLM cost drops to ~8 s.
+**Stage 2 VLM cost in batch mode** now uses the persistent
+``vlm_filter serve`` daemon: ``batch_clean.py`` starts one sidecar at
+the beginning of a batch (env ``VLM_PYTHON_EXE``), keeps Qwen3-VL
+resident across every mesh, and tears it down when the batch ends.
+This drops per-mesh VLM cost from ~60 s (model-load-per-mesh) to ~8 s
+(inference only).
 
 ## Installation
 
-The pipeline requires two Python environments because Stage 2 uses
-`transformers >= 4.57` (for native Qwen3-VL support) while Stages 1/3/4
-use `cubvh` built against `torch 2.5`. On the reference cluster these are
-the pre-existing envs:
-
-- `/moganshan/afs_a/lbx/env/ultrashape/` — Stages 1, 3, 4 (torch 2.5.1 + cubvh 0.x + trimesh 4.4 + skimage 0.24)
-- `/moganshan/afs_a/lbx/env/buildingseg/` — Stage 2 only (torch 2.6.0 + transformers 4.57.dev)
-
-To set up elsewhere, install:
+The pipeline can run in **one environment** (transformers 4.57+ in the
+same env as cubvh) **or two** (a cubvh/torch env for Stages 1/3/4 and a
+separate transformers/Qwen3-VL env for Stage 2 — useful when the two
+packages pin incompatible torch versions).
 
 ```bash
-# Primary env
-pip install torch==2.5.1 --index-url https://download.pytorch.org/whl/cu124
-pip install git+https://github.com/ashawkey/cubvh --no-build-isolation
-pip install trimesh==4.4.7 scikit-image scipy numpy Pillow omegaconf pytorch-lightning
-# Clone UltraShape at a tag that matches the VAE weights
-git clone https://github.com/Tencent/Hunyuan3D-2.1  # UltraShape inherits this VAE
-
-# VLM env
+# One-env install (simplest — requires a CUDA build of torch that
+# supports both cubvh and transformers 4.57)
 pip install torch==2.6 --index-url https://download.pytorch.org/whl/cu124
-pip install "git+https://github.com/huggingface/transformers.git"  # 4.57+
-pip install Pillow
+pip install git+https://github.com/ashawkey/cubvh --no-build-isolation
+pip install -e .                 # this repo
+pip install transformers>=4.57   # for Qwen3-VL
+# Clone UltraShape at a tag that matches the VAE weights
+git clone https://github.com/Tencent/Hunyuan3D-2.1
 ```
+
+For the **two-env split**, install cubvh into env A, transformers into
+env B, and set ``VLM_PYTHON_EXE`` to env B's ``python`` executable
+(see configuration below).
+
+### Configuration — environment variables
+
+Cluster-specific paths (weights, sidecar interpreter, HSSD root) are
+**not** hard-coded. Set whichever of these apply to your setup — all
+are optional; if unset the pipeline falls back to HuggingFace hub ids
+and in-process execution:
+
+| Variable | Purpose |
+|---|---|
+| `QWEN3VL_MODEL_PATH` | Local dir or HF id for Qwen3-VL-8B-Instruct. Default: ``Qwen/Qwen3-VL-8B-Instruct``. |
+| `ULTRASHAPE_VAE_CONFIG` | YAML config for the UltraShape VAE (Stage 4). |
+| `ULTRASHAPE_VAE_CKPT` | ``.pt`` checkpoint for the UltraShape VAE. |
+| `ULTRASHAPE_REPO_ROOT` | Root of the UltraShape repo (only needed if the ``ultrashape`` Python package is not already importable). |
+| `VLM_PYTHON_EXE` | Python interpreter for the Stage 2 sidecar. Unset → Stage 2 runs in-process. |
+| `VLM_SIDECAR_CWD` | Working directory for the sidecar. Defaults to the repo root. |
+| `VLM_SIDECAR_CUDA_VISIBLE_DEVICES` | Propagated to the sidecar as ``CUDA_VISIBLE_DEVICES``. |
+
+Copy ``.env.example`` to ``.env`` and fill in the values for your
+cluster, then export them however you prefer (e.g. ``export $(grep -v
+'^#' .env | xargs)`` in bash).
 
 ### Weights required
 
-- **Qwen3-VL-8B-Instruct**: ~17 GB safetensors. On the reference cluster at
-  `/moganshan/afs_a/anmt/action/Qwen3-VL/Qwen3-VL-8B-Instruct/`.
-- **UltraShape VAE** (from Hunyuan3D-2.1, re-finetuned): one `.pt` file
-  at `/moganshan/afs_a/lbx/hf/hub/models--infinith--UltraShape/snapshots/5aeb21a7185d39f042d02b2695802f125a6f5159/ultrashape_v1.pt`.
-
-All paths are override-able via CLI flags.
+- **Qwen3-VL-8B-Instruct**: ~17 GB safetensors. Point ``QWEN3VL_MODEL_PATH`` at a local checkpoint, or leave unset to download from HuggingFace.
+- **UltraShape VAE** (from Hunyuan3D-2.1, re-finetuned): one ``.pt`` file plus the repo's config YAML. Set ``ULTRASHAPE_VAE_CKPT`` and ``ULTRASHAPE_VAE_CONFIG``. The VAE is optional; pass ``--skip-vae`` to run the rest of Stage 4 without it.
 
 ## CLI usage
 
@@ -102,8 +117,10 @@ python -m ultrashape_cleaning.clean_mesh \
     --render-dir ./renders --vlm-cache-dir ./.vlm_cache
 ```
 
-The pipeline runs Stages 1 → 3 → 4 in-process and Stage 2 as a subprocess
-in the `buildingseg` env (path configurable).
+The pipeline runs Stages 1 → 3 → 4 in the current interpreter. Stage 2
+runs in-process by default; set ``VLM_PYTHON_EXE`` to route it through
+a separate interpreter (useful when transformers 4.57+ and cubvh pin
+incompatible torch versions).
 
 ### Batch processing
 
@@ -115,6 +132,13 @@ python -m ultrashape_cleaning.batch_clean \
     --limit 100 --shuffle --seed 42 \
     --resolution 1024 --canonicalize geom
 ```
+
+When ``VLM_PYTHON_EXE`` is set the batch runner automatically spawns a
+single persistent ``VLMDaemonClient`` for Stage 2 and reuses it across
+all meshes — the Qwen3-VL model is loaded once (~60 s) instead of once
+per mesh. If the daemon fails to start (missing transformers in the
+sidecar env, bad model path, etc.), the batch falls back transparently
+to the per-mesh subprocess path.
 
 ### Individual stages
 

@@ -2,11 +2,14 @@
 
 Run with:
 
-    CUDA_VISIBLE_DEVICES=0 /moganshan/afs_a/lbx/env/ultrashape/bin/python \\
-        tests/test_smoke.py
+    python tests/test_smoke.py
 
 Or with pytest if installed:
     pytest tests/test_smoke.py -v
+
+CUDA-dependent tests are skipped when ``torch.cuda.is_available()`` is
+false, so CPU-only clones of the repo can still exercise the import
+surface and the pure-Python checks.
 
 Each test prints PASS/FAIL and returns a nonzero exit code on failure.
 """
@@ -83,7 +86,11 @@ def test_meshio_roundtrip():
 
 def test_watertighten_sphere():
     """A holed sphere should come out watertight after Stage 1."""
-    import torch
+    try:
+        import torch
+    except ImportError:
+        print("[SKIP] test_watertighten_sphere (torch not installed)")
+        return
     if not torch.cuda.is_available():
         print("[SKIP] test_watertighten_sphere (no CUDA)")
         return
@@ -102,7 +109,11 @@ def test_watertighten_sphere():
 
 
 def test_renderer_outputs_rgb():
-    import torch
+    try:
+        import torch
+    except ImportError:
+        print("[SKIP] test_renderer_outputs_rgb (torch not installed)")
+        return
     if not torch.cuda.is_available():
         print("[SKIP] test_renderer_outputs_rgb (no CUDA)")
         return
@@ -128,13 +139,21 @@ def test_canonicalize_geom():
     R = np.asarray(R)
     err = float(np.linalg.norm(R @ R.T - np.eye(3)))
     assert err < 1e-5, f"R not orthogonal: err={err}"
-    # Determinant should be ~+1 (proper rotation) or -1 (rotation+reflection).
-    assert abs(abs(np.linalg.det(R)) - 1.0) < 1e-5
+    # Determinant MUST be +1 (proper rotation); a reflection (-1) would
+    # mirror the object instead of rotating it. ``_build_rotation``
+    # flips the ``right`` axis when the input frame is left-handed to
+    # enforce this; see canonicalize.py::_build_rotation.
+    det = float(np.linalg.det(R))
+    assert abs(det - 1.0) < 1e-5, f"R must be proper rotation, got det={det}"
     print("[PASS] test_canonicalize_geom")
 
 
 def test_filter_geometry_no_vae():
-    import torch
+    try:
+        import torch
+    except ImportError:
+        print("[SKIP] test_filter_geometry_no_vae (torch not installed)")
+        return
     if not torch.cuda.is_available():
         print("[SKIP] test_filter_geometry_no_vae (no CUDA)")
         return

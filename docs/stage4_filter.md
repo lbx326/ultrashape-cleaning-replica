@@ -35,9 +35,11 @@ runs in **26 seconds for 20k points**.
 
 ### Check B: UltraShape VAE reconstruction chamfer
 
-Loads the real UltraShape VAE (`ShapeVAE`) from
-`models--infinith--UltraShape/snapshots/.../ultrashape_v1.pt`, with
-architecture defined in `configs/infer_dit_refine.yaml`.
+Loads the real UltraShape VAE (`ShapeVAE`) from a checkpoint pointed at
+by ``ULTRASHAPE_VAE_CKPT`` (typically ``ultrashape_v1.pt`` from the
+``infinith/UltraShape`` HuggingFace hub repo) with architecture defined
+in a YAML pointed at by ``ULTRASHAPE_VAE_CONFIG`` (typically
+``configs/infer_dit_refine.yaml`` in the UltraShape repo).
 
 Pipeline:
 

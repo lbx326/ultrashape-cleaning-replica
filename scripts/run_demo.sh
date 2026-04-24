@@ -1,21 +1,34 @@
 #!/usr/bin/env bash
-# Quick demo on two HSSD meshes. Requires the reference cluster paths to be
-# available; edit if you're elsewhere.
+# Quick demo on two HSSD meshes.
+#
+# Required environment:
+#   HSSD_DIR          Path to a directory containing HSSD ``*.glb`` files.
+#                     Must contain both the sofa and clock fixtures below
+#                     (override by editing ``A`` / ``B``).
+#
+# Optional:
+#   VLM_PYTHON_EXE    If set, Stage 2 runs in that interpreter.
+#   QWEN3VL_MODEL_PATH  Path or HF id for Qwen3-VL. Defaults to the HF hub.
+#   ULTRASHAPE_VAE_CONFIG / ULTRASHAPE_VAE_CKPT   Required for Stage 4 VAE.
+#   CUDA_VISIBLE_DEVICES  Passed through (defaults to 0).
+#
+# See ``.env.example`` for the full set of variables.
 set -euo pipefail
 
-ENV_UL=/moganshan/afs_a/lbx/env/ultrashape/bin/python
-HSSD_DIR=/moganshan/afs_a/rsync/chuan/TRELLIS/datasets/hssd/raw
-OUT=./demo_out
+HSSD_DIR="${HSSD_DIR:?HSSD_DIR must point at a directory containing the demo GLBs}"
+PYTHON="${PYTHON:-python}"
+OUT="${OUT:-./demo_out}"
+: "${CUDA_VISIBLE_DEVICES:=0}"; export CUDA_VISIBLE_DEVICES
 mkdir -p "$OUT"
 
 # Pick two varied meshes.
-A=00366b86401aa16b702c21de49fd59b75ab9c57b.glb   # sofa
-B=00258bed0c6e87a14e33c3eebffc48c898135698.glb   # clock
+A=${DEMO_SOFA:-00366b86401aa16b702c21de49fd59b75ab9c57b.glb}   # sofa
+B=${DEMO_CLOCK:-00258bed0c6e87a14e33c3eebffc48c898135698.glb}  # clock
 
 for f in "$A" "$B"; do
   NAME="${f%.glb}"
   echo "===> $NAME"
-  CUDA_VISIBLE_DEVICES=0 "$ENV_UL" -m ultrashape_cleaning.clean_mesh \
+  "$PYTHON" -m ultrashape_cleaning.clean_mesh \
       --input  "$HSSD_DIR/$f" \
       --output "$OUT/$NAME.clean.ply" \
       --save-report "$OUT/$NAME.report.json" \

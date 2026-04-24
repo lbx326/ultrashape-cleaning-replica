@@ -29,6 +29,7 @@ from typing import Literal, Optional
 import numpy as np
 import trimesh
 
+from . import _config
 from ._meshio import PathLike, load_mesh, save_mesh
 
 
@@ -182,6 +183,10 @@ def _build_rotation(up: np.ndarray, forward: np.ndarray) -> np.ndarray:
     """Return R such that R @ up_world = +Y and R @ forward_world = +Z.
 
     UltraShape convention (inherited from Hunyuan3D): up=+Y, front=+Z.
+    The returned matrix is always a proper rotation (``det(R) = +1``);
+    if the input ``(up, forward)`` frame is left-handed we flip ``right``
+    so the output never contains a reflection (which would mirror the
+    object instead of rotating it).
     """
     up = up / np.linalg.norm(up).clip(1e-10)
     # Orthonormalize forward w.r.t. up.
@@ -194,6 +199,12 @@ def _build_rotation(up: np.ndarray, forward: np.ndarray) -> np.ndarray:
     C = np.stack([right, up, forward], axis=1)  # (3,3)
     # R = C^T maps world -> canonical.
     R = C.T
+    # Guard against reflection: if the (right, up, forward) frame is
+    # left-handed (det = -1), flip ``right`` so R becomes a proper rotation.
+    if np.linalg.det(R) < 0:
+        right = -right
+        C = np.stack([right, up, forward], axis=1)
+        R = C.T
     return R
 
 
@@ -412,17 +423,13 @@ def _six_view_grid(mesh: trimesh.Trimesh, resolution: int = 384,
         grid[0:h, i*w:(i+1)*w] = imgs[k]
     for i, k in enumerate(order_bot):
         grid[h:2*h, i*w:(i+1)*w] = imgs[k]
-    # Add axis labels
+    # Add axis labels. Use PIL's default bitmap font; we used to hard-code
+    # a DejaVu path that's absent on macOS/Windows clones.
     try:
         from PIL import Image, ImageDraw, ImageFont
         im = Image.fromarray(grid)
         d = ImageDraw.Draw(im)
-        try:
-            font = ImageFont.truetype(
-                "/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf",
-                size=max(14, h // 20))
-        except Exception:
-            font = ImageFont.load_default()
+        font = ImageFont.load_default()
         for i, k in enumerate(order_top):
             x, y = i*w + 8, 8
             d.rectangle([x-2, y-2, x+40, y+24], fill=(0, 0, 0))
@@ -638,8 +645,8 @@ def main(argv: Optional[list[str]] = None) -> int:
     p.add_argument("--resolution", type=int, default=384)
     p.add_argument("--device", default="cuda")
     p.add_argument("--model-path",
-                   default="/moganshan/afs_a/anmt/action/Qwen3-VL/"
-                           "Qwen3-VL-8B-Instruct/")
+                   default=_config.get_qwen3vl_model_path(),
+                   help="Qwen3-VL model dir or HF id (env: QWEN3VL_MODEL_PATH)")
     args = p.parse_args(argv)
 
     mesh = load_mesh(args.input)

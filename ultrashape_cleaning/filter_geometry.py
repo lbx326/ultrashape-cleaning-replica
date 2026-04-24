@@ -38,6 +38,7 @@ import numpy as np
 import torch
 import trimesh
 
+from . import _config
 from ._meshio import PathLike, load_mesh
 
 
@@ -56,11 +57,19 @@ class FilterConfig:
     primitive_axis_alignment_threshold: float = 0.85
     volume_area_ratio_min: float = 0.01  # thin-shell check
     device: str = "cuda"
-    # VAE config (lazy-loaded)
-    vae_config_path: str = "/moganshan/afs_a/lbx/workspace/UltraShape-1.0/configs/infer_dit_refine.yaml"
-    vae_ckpt_path: str = ("/moganshan/afs_a/lbx/hf/hub/models--infinith--UltraShape/"
-                          "snapshots/5aeb21a7185d39f042d02b2695802f125a6f5159/"
-                          "ultrashape_v1.pt")
+    # VAE config (lazy-loaded). Resolved from env vars
+    # ULTRASHAPE_VAE_CONFIG / ULTRASHAPE_VAE_CKPT — see ``_config.py``.
+    vae_config_path: Optional[str] = dataclasses.field(
+        default_factory=_config.get_vae_config_path,
+    )
+    vae_ckpt_path: Optional[str] = dataclasses.field(
+        default_factory=_config.get_vae_ckpt_path,
+    )
+    # Optional: path to the UltraShape repo root for sys.path injection.
+    # Only needed when the ultrashape package is not already importable.
+    ultrashape_repo_root: Optional[str] = dataclasses.field(
+        default_factory=_config.get_ultrashape_repo_root,
+    )
     # Skip flags for batch throughput.
     skip_vae: bool = False
 
@@ -196,6 +205,42 @@ def make_even_crossings_gt(mesh: trimesh.Trimesh, device: str = "cuda",
 # ---------------------------------------------------------------------------
 # Check B: UltraShape VAE-based fragmentation detector
 # ---------------------------------------------------------------------------
+import contextlib
+
+
+@contextlib.contextmanager
+def _ultrashape_on_sys_path(repo_root: Optional[str]):
+    """Context manager that temporarily inserts the UltraShape repo on
+    ``sys.path`` while imports resolve, then removes it.
+
+    Avoids permanent process-global mutation that could shadow unrelated
+    packages named ``ultrashape.*``. Yields True iff it inserted a path.
+    """
+    import sys
+    if not repo_root:
+        yield False
+        return
+    if not Path(repo_root).exists():
+        raise FileNotFoundError(
+            f"ULTRASHAPE_REPO_ROOT points at {repo_root} which does not "
+            f"exist. Clone https://github.com/Tencent/Hunyuan3D-2.1 (or the "
+            f"UltraShape repo) there, or unset the env var if the "
+            f"``ultrashape`` package is already installed."
+        )
+    inserted = False
+    if repo_root not in sys.path:
+        sys.path.insert(0, repo_root)
+        inserted = True
+    try:
+        yield inserted
+    finally:
+        if inserted:
+            try:
+                sys.path.remove(repo_root)
+            except ValueError:
+                pass
+
+
 class UltraShapeVAE:
     """Lazy-loaded ShapeVAE wrapper.
 
@@ -217,22 +262,52 @@ class UltraShapeVAE:
     @classmethod
     def load(
         cls,
-        config_path: str = "/moganshan/afs_a/lbx/workspace/UltraShape-1.0/configs/infer_dit_refine.yaml",
-        ckpt_path: str = ("/moganshan/afs_a/lbx/hf/hub/models--infinith--UltraShape/"
-                          "snapshots/5aeb21a7185d39f042d02b2695802f125a6f5159/"
-                          "ultrashape_v1.pt"),
+        config_path: Optional[str] = None,
+        ckpt_path: Optional[str] = None,
         device: str = "cuda",
+        ultrashape_repo_root: Optional[str] = None,
     ) -> "UltraShapeVAE":
-        import sys
-        sys.path.insert(0, "/moganshan/afs_a/lbx/workspace/UltraShape-1.0")
-        from ultrashape.utils.misc import instantiate_from_config
-        from omegaconf import OmegaConf
+        """Build the VAE from config + weights.
 
-        cfg = OmegaConf.load(config_path)
-        vae = instantiate_from_config(cfg.model.params.vae_config)
-        weights = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        vae.load_state_dict(weights["vae"], strict=True)
-        vae.eval().to(device)
+        Paths default to env vars ``ULTRASHAPE_VAE_CONFIG``,
+        ``ULTRASHAPE_VAE_CKPT``, and ``ULTRASHAPE_REPO_ROOT``. If the
+        UltraShape package is already importable you may omit the repo
+        root; otherwise set ``ULTRASHAPE_REPO_ROOT`` or pass the path.
+        """
+        config_path = config_path or _config.get_vae_config_path()
+        ckpt_path = ckpt_path or _config.get_vae_ckpt_path()
+        ultrashape_repo_root = (ultrashape_repo_root
+                                or _config.get_ultrashape_repo_root())
+        if config_path is None or ckpt_path is None:
+            raise RuntimeError(
+                "UltraShape VAE weights not configured. Set the "
+                "ULTRASHAPE_VAE_CONFIG and ULTRASHAPE_VAE_CKPT environment "
+                "variables (or pass ``config_path`` / ``ckpt_path`` to "
+                "UltraShapeVAE.load) pointing at the UltraShape 1.0 config "
+                "YAML and ``ultrashape_v1.pt`` checkpoint. To run the "
+                "pipeline without the VAE, pass ``--skip-vae``."
+            )
+        if not Path(config_path).exists():
+            raise FileNotFoundError(
+                f"UltraShape VAE config not found at {config_path}. "
+                f"Set ULTRASHAPE_VAE_CONFIG to the correct path."
+            )
+        if not Path(ckpt_path).exists():
+            raise FileNotFoundError(
+                f"UltraShape VAE checkpoint not found at {ckpt_path}. "
+                f"Set ULTRASHAPE_VAE_CKPT to the correct path."
+            )
+
+        from omegaconf import OmegaConf
+        with _ultrashape_on_sys_path(ultrashape_repo_root):
+            from ultrashape.utils.misc import instantiate_from_config
+
+            cfg = OmegaConf.load(config_path)
+            vae = instantiate_from_config(cfg.model.params.vae_config)
+            weights = torch.load(ckpt_path, map_location="cpu",
+                                 weights_only=False)
+            vae.load_state_dict(weights["vae"], strict=True)
+            vae.eval().to(device)
         return cls(vae, device)
 
     @torch.inference_mode()
@@ -254,9 +329,8 @@ class UltraShapeVAE:
         The VAE then internally splits these 7 features into ``point_feats=4``
         per point: 3 normals + 1 sharp-edge flag; XYZ is treated separately.
         """
-        import sys
-        sys.path.insert(0, "/moganshan/afs_a/lbx/workspace/UltraShape-1.0")
-        from ultrashape.surface_loaders import normalize_mesh, sample_pointcloud
+        with _ultrashape_on_sys_path(_config.get_ultrashape_repo_root()):
+            from ultrashape.surface_loaders import normalize_mesh, sample_pointcloud
         from skimage import measure as skmeasure
 
         t0 = time.time()
@@ -305,8 +379,14 @@ class UltraShapeVAE:
             verts_np, faces_np, _, _ = skmeasure.marching_cubes(
                 logits_vol.detach().cpu().numpy(), level=0.0,
             )
-            # Map from index space to [-1, 1].
-            verts_np = (verts_np / float(query_grid - 1)) * 2.0 - 1.0
+            # Map from index space back to the query-grid's VOXEL-CENTER
+            # world coordinates. The query grid lives at
+            # ``-1 + s/2 .. 1 - s/2`` with ``s = 2/query_grid`` — voxel
+            # centers, not grid corners. Using ``(v / (query_grid - 1)) * 2
+            # - 1`` (corner-to-corner) biased the recon by ~1/query_grid
+            # (~0.008 at grid=128) which inflated the chamfer calibration.
+            s = 2.0 / float(query_grid)
+            verts_np = -1.0 + s * 0.5 + verts_np.astype(np.float32) * s
             recon = trimesh.Trimesh(vertices=verts_np,
                                     faces=faces_np.astype(np.int64),
                                     process=True)
