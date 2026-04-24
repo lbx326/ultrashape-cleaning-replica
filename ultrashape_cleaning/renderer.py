@@ -139,6 +139,78 @@ def _shade(
 # ---------------------------------------------------------------------------
 # Core render
 # ---------------------------------------------------------------------------
+def _precompute_vertex_normals(verts_np: np.ndarray, faces_np: np.ndarray) -> np.ndarray:
+    """Area-weighted vertex normals. Pure numpy, runs once per mesh."""
+    v0 = verts_np[faces_np[:, 0]]
+    v1 = verts_np[faces_np[:, 1]]
+    v2 = verts_np[faces_np[:, 2]]
+    fn = np.cross(v1 - v0, v2 - v0)  # face normal × 2·area
+    vn = np.zeros_like(verts_np)
+    for k in range(3):
+        np.add.at(vn, faces_np[:, k], fn)
+    nrm = np.linalg.norm(vn, axis=-1, keepdims=True)
+    return vn / np.maximum(nrm, 1e-12)
+
+
+def _render_pass(
+    camera: "Camera",
+    resolution: int,
+    device: str,
+    verts: torch.Tensor,
+    faces: torch.Tensor,
+    vertex_normals: torch.Tensor,
+    bvh,
+    background: tuple[float, float, float],
+) -> torch.Tensor:
+    """Single render pass at the given resolution; returns (R, R, 3) float32 in [0,1]."""
+    origins, dirs = camera.view_rays(resolution, device=device)
+    out = bvh.ray_trace(origins, dirs)
+    if isinstance(out, tuple):
+        if len(out) == 3:
+            positions, face_id, _ = out
+        elif len(out) == 2:
+            positions, face_id = out
+        else:
+            raise RuntimeError(f"Unknown cubvh.ray_trace return arity {len(out)}")
+    else:
+        face_id = out
+        positions = origins + dirs
+    face_id = face_id.view(-1).long()
+    positions = positions.view(-1, 3)
+    hit_mask = face_id >= 0
+    n_rays = face_id.numel()
+
+    # Phong interpolated normals via barycentric weights at the hit point.
+    smooth_normals = torch.zeros((n_rays, 3), device=device, dtype=torch.float32)
+    if hit_mask.any():
+        fids = face_id[hit_mask]
+        hit_faces = faces[fids].long()
+        vs = verts[hit_faces]  # (N_hit, 3, 3)
+        v0, v1, v2 = vs[:, 0], vs[:, 1], vs[:, 2]
+        p = positions[hit_mask]
+        n_face = torch.linalg.cross(v1 - v0, v2 - v0)
+        area2 = n_face.norm(dim=-1).clamp_min(1e-20)
+        # Sub-triangle areas for barycentric weights (w0, w1, w2).
+        w0 = torch.linalg.cross(v1 - p, v2 - p).norm(dim=-1) / area2
+        w1 = torch.linalg.cross(v2 - p, v0 - p).norm(dim=-1) / area2
+        w2 = (1.0 - w0 - w1).clamp(min=0.0)
+        vn = vertex_normals[hit_faces]  # (N_hit, 3, 3)
+        n_interp = (w0[:, None] * vn[:, 0]
+                    + w1[:, None] * vn[:, 1]
+                    + w2[:, None] * vn[:, 2])
+        n_interp = n_interp / n_interp.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+        smooth_normals[hit_mask] = n_interp
+
+    colors = _shade(
+        hit_positions=positions,
+        hit_face_normals=smooth_normals,
+        view_dirs=dirs,
+        hit_mask=hit_mask,
+        background=background,
+    )
+    return colors.view(resolution, resolution, 3)
+
+
 def render_view(
     mesh: trimesh.Trimesh,
     camera: Camera,
@@ -146,53 +218,34 @@ def render_view(
     device: str = "cuda",
     background: tuple[float, float, float] = (1.0, 1.0, 1.0),
     use_cached_bvh: Optional[object] = None,
+    supersample: int = 2,
+    vertex_normals: Optional[torch.Tensor] = None,
 ) -> np.ndarray:
-    """Render one view to (H, W, 3) uint8 numpy array."""
+    """Render one view with Phong smooth shading + SSAA.
+
+    supersample: render at ``resolution*ss`` then box-filter down to ``resolution``.
+    ``2`` kills edge aliasing at 4× cost; ``1`` disables SSAA (fastest).
+    """
     import cubvh
     verts = torch.as_tensor(np.asarray(mesh.vertices), device=device, dtype=torch.float32)
     faces = torch.as_tensor(np.asarray(mesh.faces), device=device, dtype=torch.int32)
+    if vertex_normals is None:
+        vn_np = _precompute_vertex_normals(np.asarray(mesh.vertices),
+                                           np.asarray(mesh.faces))
+        vertex_normals = torch.as_tensor(vn_np, device=device, dtype=torch.float32)
     if use_cached_bvh is None:
         bvh = cubvh.cuBVH(verts, faces)
     else:
         bvh = use_cached_bvh
-    origins, dirs = camera.view_rays(resolution, device=device)
-    # cubvh.ray_trace: inputs (N,3) rays. Returns (positions, face_id, depths).
-    # The signature from cubvh/api.py: signed_distance is similar; ray_trace
-    # returns a tuple (positions, face_id, depth) in some versions — the
-    # code above returned the tuple, so we handle both.
-    out = bvh.ray_trace(origins, dirs)
-    if isinstance(out, tuple):
-        if len(out) == 3:
-            positions, face_id, depth = out
-        elif len(out) == 2:
-            positions, face_id = out
-        else:
-            raise RuntimeError(f"Unknown cubvh.ray_trace return arity {len(out)}")
-    else:
-        # Some versions return just face_id.
-        face_id = out
-        positions = origins + dirs  # unused
-    face_id = face_id.view(-1).long()
-    hit_mask = face_id >= 0
 
-    # Compute per-face normals on GPU.
-    vf = verts[faces.long()]  # (F, 3, 3)
-    e1 = vf[:, 1] - vf[:, 0]
-    e2 = vf[:, 2] - vf[:, 0]
-    face_normals = torch.linalg.cross(e1, e2)
-    face_normals = face_normals / face_normals.norm(dim=-1, keepdim=True).clamp_min(1e-12)
-
-    hit_normals = torch.zeros((face_id.numel(), 3), device=device, dtype=torch.float32)
-    hit_normals[hit_mask] = face_normals[face_id[hit_mask]]
-
-    colors = _shade(
-        hit_positions=positions.view(-1, 3),
-        hit_face_normals=hit_normals,
-        view_dirs=dirs,
-        hit_mask=hit_mask,
-        background=background,
-    )
-    img = (colors.view(resolution, resolution, 3) * 255.0).clamp(0, 255)
+    ss = max(1, int(supersample))
+    hi = resolution * ss
+    hi_img = _render_pass(camera, hi, device, verts, faces, vertex_normals, bvh,
+                          background)
+    if ss > 1:
+        # Box-filter down (simple 2D average over ss×ss blocks).
+        hi_img = hi_img.view(resolution, ss, resolution, ss, 3).mean(dim=(1, 3))
+    img = (hi_img * 255.0).clamp(0, 255)
     return img.detach().cpu().numpy().astype(np.uint8)
 
 
@@ -202,15 +255,21 @@ def render_views(
     resolution: int = 512,
     device: str = "cuda",
     background: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    supersample: int = 2,
 ) -> dict[str, np.ndarray]:
-    """Render multiple views efficiently by reusing the BVH."""
+    """Render multiple views efficiently by reusing the BVH and vertex normals."""
     import cubvh
     verts = torch.as_tensor(np.asarray(mesh.vertices), device=device, dtype=torch.float32)
     faces = torch.as_tensor(np.asarray(mesh.faces), device=device, dtype=torch.int32)
+    vn_np = _precompute_vertex_normals(np.asarray(mesh.vertices),
+                                       np.asarray(mesh.faces))
+    vertex_normals = torch.as_tensor(vn_np, device=device, dtype=torch.float32)
     bvh = cubvh.cuBVH(verts, faces)
     return {
         name: render_view(mesh, cam, resolution=resolution, device=device,
-                          background=background, use_cached_bvh=bvh)
+                          background=background, use_cached_bvh=bvh,
+                          supersample=supersample,
+                          vertex_normals=vertex_normals)
         for name, cam in cameras.items()
     }
 
@@ -220,6 +279,7 @@ def render_four_views(
     resolution: int = 512,
     device: str = "cuda",
     background: tuple[float, float, float] = (1.0, 1.0, 1.0),
+    supersample: int = 2,
 ) -> dict[str, np.ndarray]:
     """Render front/right/back/left for a mesh centered at its bbox center."""
     bbox = mesh.bounds
@@ -229,7 +289,7 @@ def render_four_views(
     wanted = ["front", "right", "back", "left"]
     cams = {k: cams[k] for k in wanted}
     return render_views(mesh, cams, resolution=resolution, device=device,
-                        background=background)
+                        background=background, supersample=supersample)
 
 
 # ---------------------------------------------------------------------------
