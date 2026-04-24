@@ -90,44 +90,58 @@ class VLMDaemonClient:
             stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
             text=True, env=env, cwd=cwd, bufsize=1,
         )
-        # Wait for "ready" with a timeout. If the subprocess dies before
-        # printing the ready line (e.g. missing transformers dep), the
-        # plain ``readline()`` from the review hung forever — gate it
-        # behind a background thread + timer.
-        line_container: list = []
+        # Wait for the ready-JSON handshake.  ``vlm_filter._cli_serve`` prints
+        # non-JSON progress lines (e.g. "[Qwen3VL] loading via ...") BEFORE the
+        # ready line, so we must skip them.  Every readline is gated behind a
+        # background thread so a crashed subprocess can't wedge us forever.
+        import time as _time
+        deadline = _time.time() + ready_timeout
+        info = None
+        last_line = ""
+        while _time.time() < deadline:
+            line_container: list = []
 
-        def _read_line():
-            try:
-                line_container.append(self.proc.stdout.readline())
-            except Exception:
-                line_container.append("")
+            def _read_line():
+                try:
+                    line_container.append(self.proc.stdout.readline())
+                except Exception:
+                    line_container.append("")
 
-        t = threading.Thread(target=_read_line, daemon=True)
-        t.start()
-        t.join(timeout=ready_timeout)
-        if t.is_alive() or not line_container:
-            self._kill()
-            raise VLMDaemonReadyError(
-                f"VLM sidecar did not report ready within {ready_timeout}s"
-            )
-        line = (line_container[0] or "").strip()
-        if not line:
-            # Subprocess exited; read stderr for diagnostic.
+            t = threading.Thread(target=_read_line, daemon=True)
+            t.start()
+            remaining = max(deadline - _time.time(), 1.0)
+            t.join(timeout=remaining)
+            if t.is_alive():
+                # Overall timeout reached mid-read.
+                break
+            if not line_container:
+                continue
+            line = (line_container[0] or "").rstrip("\r\n")
+            if not line:
+                # EOF -- subprocess exited.
+                break
+            last_line = line
+            stripped = line.strip()
+            if not (stripped.startswith("{") or stripped.startswith("[")):
+                # Not JSON; this is a status / log line. Keep looping.
+                continue
             try:
-                stderr = self.proc.stderr.read()[-500:]
+                info = self._json.loads(stripped)
+                break
             except Exception:
-                stderr = ""
+                # Looks JSON-ish but isn't — treat as noise and continue.
+                continue
+
+        if info is None:
+            try:
+                stderr_tail = self.proc.stderr.read()[-500:]
+            except Exception:
+                stderr_tail = ""
             self._kill()
             raise VLMDaemonReadyError(
-                f"VLM sidecar exited before reporting ready. stderr tail: "
-                f"{stderr}"
-            )
-        try:
-            info = self._json.loads(line)
-        except Exception as e:
-            self._kill()
-            raise VLMDaemonReadyError(
-                f"VLM sidecar ready-line was not JSON: {line!r} ({e})"
+                "VLM sidecar did not report a valid ready JSON within "
+                f"{ready_timeout}s (last stdout line: {last_line!r}). "
+                f"stderr tail: {stderr_tail}"
             )
         self.ready = bool(info.get("ready", False))
         self.model_name = info.get("model")

@@ -281,7 +281,11 @@ class Qwen3VLClient:
             model = Q3VL.from_pretrained(
                 model_path,
                 torch_dtype=getattr(torch, dtype),
-                device_map="auto" if device == "cuda" else None,
+                # Avoid ``device_map="auto"`` — on contested boxes it
+                # occasionally CPU-offloads even with plenty of free VRAM,
+                # turning a 2 s inference into 20+ min. Force full-GPU
+                # placement via ``.to(device)`` after load instead (below).
+                device_map=None,
                 attn_implementation=attn_impl,
             )
             model_loaded = True
@@ -294,10 +298,19 @@ class Qwen3VLClient:
             model = AutoModelForImageTextToText.from_pretrained(
                 model_path,
                 torch_dtype=getattr(torch, dtype),
-                device_map="auto" if device == "cuda" else None,
+                # Avoid ``device_map="auto"`` — on contested boxes it
+                # occasionally CPU-offloads even with plenty of free VRAM,
+                # turning a 2 s inference into 20+ min. Force full-GPU
+                # placement via ``.to(device)`` after load instead (below).
+                device_map=None,
                 attn_implementation=attn_impl,
             )
 
+        if device == "cuda":
+            # Explicit full-GPU placement; see note above about device_map.
+            model = model.to("cuda")
+        elif device != "cpu":
+            model = model.to(device)
         self.model = model.eval()
         self.processor = AutoProcessor.from_pretrained(model_path)
         self.model_name = os.path.basename(str(model_path).rstrip("/"))
