@@ -48,14 +48,24 @@ from ._meshio import PathLike, load_mesh
 @dataclasses.dataclass
 class FilterConfig:
     ray_samples: int = 20_000
-    ray_sign_agreement_threshold: float = 0.92  # tolerate 8% bad winding
+    # Paper §2.1 rejects meshes whose "interior-to-exterior point ratio" is
+    # too low — i.e. thin shells where random points in the bbox almost
+    # never land inside. Threshold at 0.03 = 3% of bbox samples inside.
+    thin_shell_interior_ratio_min: float = 0.03
+    # Diagnostic only; no rejection. Low agreement suggests non-manifold /
+    # inverted winding but is not in the paper as a filter step.
+    ray_sign_agreement_threshold: float = 0.0  # 0 = disabled (diagnostic only)
     max_components: int = 8
     frag_vae_chamfer_threshold: Optional[float] = 0.15  # empirical on HSSD;
     # see docs/stage4_filter.md for calibration details. Clean sofa ≈ 0.064,
     # fragmented ≈ 0.40, primitive ≈ 0.40. Above 0.15 is OOD.
     primitive_vertex_threshold: int = 500
     primitive_axis_alignment_threshold: float = 0.85
-    volume_area_ratio_min: float = 0.01  # thin-shell check
+    # Kept for backwards compatibility with older configs; no longer used
+    # as a rejection criterion. The paper uses interior-to-exterior point
+    # ratios (see ``thin_shell_interior_ratio_min`` above) which is
+    # topology-aware, not just a geometric vol/area.
+    volume_area_ratio_min: Optional[float] = None
     device: str = "cuda"
     # VAE config (lazy-loaded). Resolved from env vars
     # ULTRASHAPE_VAE_CONFIG / ULTRASHAPE_VAE_CKPT — see ``_config.py``.
@@ -469,19 +479,23 @@ def filter_geometry(
     metrics["is_watertight"] = bool(mesh.is_watertight)
     metrics["is_winding_consistent"] = bool(mesh.is_winding_consistent)
 
-    # ---- Volume/area ratio (only valid on watertight)
+    # ---- Bookkeeping metric only — not a rejection criterion in the paper.
     if mesh.is_watertight:
         v = float(abs(mesh.volume))
         a = float(mesh.area) + 1e-12
         metrics["volume_area_ratio"] = v / a
-        if metrics["volume_area_ratio"] < cfg.volume_area_ratio_min:
-            reasons.append(
-                f"thin_shell vol/area={metrics['volume_area_ratio']:.4f}"
-            )
     else:
         metrics["volume_area_ratio"] = None
+    # Backwards-compat: if the caller explicitly set a threshold, honour it.
+    if (cfg.volume_area_ratio_min is not None
+        and metrics["volume_area_ratio"] is not None
+        and metrics["volume_area_ratio"] < cfg.volume_area_ratio_min):
+        reasons.append(
+            f"thin_shell_vol_area={metrics['volume_area_ratio']:.4f}"
+        )
 
-    # ---- Check A: ray sign agreement
+    # ---- Paper §2.1 thin-shell rejection via interior-to-exterior point ratio,
+    # piggy-backing on the same ray-parity GT used for Check A below.
     try:
         if ground_truth_inside is None:
             ground_truth_inside = make_even_crossings_gt(mesh, device=cfg.device)
@@ -489,7 +503,18 @@ def filter_geometry(
                                          n_samples=cfg.ray_samples,
                                          device=cfg.device)
         metrics.update(ray_metrics)
-        if ray_metrics["ray_sign_agreement"] < cfg.ray_sign_agreement_threshold:
+        interior_ratio = ray_metrics.get("fraction_inside_gt")
+        if (interior_ratio is not None
+            and interior_ratio < cfg.thin_shell_interior_ratio_min):
+            reasons.append(
+                f"thin_shell interior_ratio={interior_ratio:.4f}"
+                f" < {cfg.thin_shell_interior_ratio_min}"
+            )
+        # Ray sign agreement kept as diagnostic; only rejects when an
+        # explicit positive threshold is configured (paper has no such step).
+        if (cfg.ray_sign_agreement_threshold > 0.0
+            and ray_metrics["ray_sign_agreement"]
+            < cfg.ray_sign_agreement_threshold):
             reasons.append(
                 f"ray_sign_disagreement={ray_metrics['ray_sign_agreement']:.3f}"
             )
