@@ -15,7 +15,13 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
-NUM_WORKERS="${1:-8}"
+# Space-separated GPU IDs to use. Override with e.g. GPU_IDS="1 2 3 4 5 6 7"
+# to skip GPU 0. Default 0..7.
+GPU_IDS="${GPU_IDS:-0 1 2 3 4 5 6 7}"
+GPU_ARR=($GPU_IDS)
+DEFAULT_NW=${#GPU_ARR[@]}
+
+NUM_WORKERS="${1:-$DEFAULT_NW}"
 BATCH_SIZE="${2:-4}"
 shift 2 2>/dev/null || true
 EXTRA="$*"
@@ -26,7 +32,7 @@ mkdir -p "$LOGDIR"
 
 PIDS=()
 for ((W=0; W<NUM_WORKERS; W++)); do
-    GPU=$((W % 8))
+    GPU=${GPU_ARR[$((W % ${#GPU_ARR[@]}))]}
     LOG="$LOGDIR/batch_filter_w${W}.log"
     echo "[launcher] spawning worker $W on GPU $GPU -> $LOG"
     CUDA_VISIBLE_DEVICES=$GPU PYTHONUNBUFFERED=1 \
