@@ -65,11 +65,17 @@ def resolve_path(ds: str, sha: str, local_path: str | None) -> Path | None:
     return None
 
 
-def collect_meshes(only: str | None = None,
+def collect_meshes(only: str | list | None = None,
                    limit_per_dataset: int = 0) -> list[dict]:
     out: list[dict] = []
+    if isinstance(only, str):
+        only_set = {x.strip() for x in only.split(",") if x.strip()}
+    elif only is None:
+        only_set = None
+    else:
+        only_set = set(only)
     for ds in DATASETS:
-        if only and ds != only:
+        if only_set and ds not in only_set:
             continue
         meta = BASE / ds / "metadata.csv"
         if not meta.exists():
@@ -120,11 +126,25 @@ def out_paths(ds: str, sha: str) -> dict:
 def worker_main(gpu_id: int, work_chunk: list[dict],
                 batch_size: int, do_vae: bool,
                 prompt_lang: str = "en",
-                wt_resolution: int = 0) -> None:
-    os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+                wt_resolution: int = 0,
+                visible_device: str | None = None) -> None:
+    """``gpu_id`` is a label for logs. ``visible_device`` is the physical
+    GPU to expose; if None we set CUDA_VISIBLE_DEVICES to ``gpu_id`` (in-
+    process worker mode). When the launcher already pins the process via
+    shell-level ``CUDA_VISIBLE_DEVICES``, pass ``visible_device=""`` to
+    skip overriding.
+    """
+    if visible_device is None:
+        os.environ["CUDA_VISIBLE_DEVICES"] = str(gpu_id)
+    elif visible_device:
+        os.environ["CUDA_VISIBLE_DEVICES"] = visible_device
     os.environ.setdefault("PYTHONUNBUFFERED", "1")
     sys.path.insert(0, str(REPO))
 
+    import gc
+    import signal
+
+    import torch
     import trimesh
     from PIL import Image
     from ultrashape_cleaning.batch_clean import VLMDaemonClient
@@ -135,6 +155,14 @@ def worker_main(gpu_id: int, work_chunk: list[dict],
         filter_geometry, FilterConfig, UltraShapeVAE,
     )
 
+    PER_MESH_TIMEOUT_S = int(os.environ.get("MESH_CLEAN_TIMEOUT", "120"))
+
+    class _MeshTimeout(Exception):
+        pass
+
+    def _alarm_handler(signum, frame):
+        raise _MeshTimeout(f"per-mesh stage timeout after {PER_MESH_TIMEOUT_S}s")
+
     print(f"[w{gpu_id}] starting on {len(work_chunk)} meshes (batch={batch_size}, vae={do_vae})",
           flush=True)
 
@@ -144,15 +172,19 @@ def worker_main(gpu_id: int, work_chunk: list[dict],
         for sub in ("_renders", "_reports", ".vlm_cache"):
             (BASE / ds / OUT_SUBDIR / sub).mkdir(parents=True, exist_ok=True)
 
-    # VLM daemon (sidecar in buildingseg env)
+    # VLM daemon (sidecar in buildingseg env). Pass cuda_visible_devices=None
+    # so the daemon inherits the parent's CUDA_VISIBLE_DEVICES (already pinned
+    # to the right GPU). This avoids any chance of mismatch when the launcher
+    # uses shell-level pinning.
     t = time.time()
-    print(f"[w{gpu_id}] spawning VLM daemon...", flush=True)
+    print(f"[w{gpu_id}] spawning VLM daemon (CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES')})...",
+          flush=True)
     daemon = VLMDaemonClient(
         python_exe=VLM_PYTHON,
         model_path=VLM_MODEL,
         device="cuda",
         cwd=str(REPO),
-        cuda_visible_devices=str(gpu_id),
+        cuda_visible_devices=None,
         ready_timeout=600.0,
     )
     print(f"[w{gpu_id}] VLM daemon ready in {time.time() - t:.1f}s", flush=True)
@@ -173,10 +205,12 @@ def worker_main(gpu_id: int, work_chunk: list[dict],
                   flush=True)
             cfg.skip_vae = True
 
-    # Pending batch buffer
+    # Pending: list of dicts WITHOUT mesh refs. Stage 4 runs immediately per
+    # mesh (memory-bounded); only the small s4 report + grid path accumulate
+    # until the VLM batch is flushed.
     pending: list[dict] = []
 
-    def flush_batch(buf: list[dict]) -> None:
+    def flush_vlm_batch(buf: list[dict]) -> None:
         if not buf:
             return
         items = []
@@ -193,30 +227,24 @@ def worker_main(gpu_id: int, work_chunk: list[dict],
             for x in buf:
                 _emit_error(x, "vlm_batch_fail", str(e))
             return
-        # Per-item Stage 4 filter on raw mesh
+        # Merge VLM + stage 4 (already computed per-mesh) into final report
         for x, vr in zip(buf, vlm_results):
+            s4 = x.get("stage4_report")
             try:
-                report = filter_geometry(x["mesh"], cfg=cfg, vae=vae,
-                                         verbose=False)
+                if s4 is None:
+                    raise RuntimeError("stage4 missing")
                 merged = {
                     "sha256": x["item"]["sha"],
                     "dataset": x["item"]["dataset"],
                     "input_path": x["item"]["path"],
                     "stage2_vlm": vr,
-                    "stage4_filter": {
-                        "is_valid": report.is_valid,
-                        "reasons": report.reasons,
-                        "metrics": report.metrics,
-                        "seconds": report.seconds,
-                    },
-                    "accepted": (
-                        bool(vr.get("accepted")) and bool(report.is_valid)
-                    ),
+                    "stage4_filter": s4,
+                    "accepted": bool(vr.get("accepted")) and bool(s4["is_valid"]),
                     "rejection_reasons": (
                         [f"stage2:{r}" for r in (vr.get("rejection_reasons") or [])]
-                        + [f"stage4:{r}" for r in report.reasons]
+                        + [f"stage4:{r}" for r in s4["reasons"]]
                     ),
-                    "seconds_total": vr.get("seconds", 0.0) + report.seconds,
+                    "seconds_total": vr.get("seconds", 0.0) + s4["seconds"],
                 }
                 x["op"]["report_json"].write_text(
                     json.dumps(merged, ensure_ascii=False, indent=2,
@@ -224,7 +252,7 @@ def worker_main(gpu_id: int, work_chunk: list[dict],
                     encoding="utf-8",
                 )
             except Exception as e:
-                _emit_error(x, "stage4_fail", str(e))
+                _emit_error(x, "merge_fail", str(e))
 
     def _emit_error(x: dict, where: str, msg: str) -> None:
         merged = {
@@ -269,19 +297,68 @@ def worker_main(gpu_id: int, work_chunk: list[dict],
             n_errors += 1
             continue
 
-        # Render
+        # Render (with timeout — pyembree/cubvh BVH build can stall on
+        # pathological meshes).
+        signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(PER_MESH_TIMEOUT_S)
         try:
             views = render_four_views(m, resolution=512, supersample=2)
             grid = make_2x2_grid(views)
             Image.fromarray(grid).save(str(op["grid_png"]))
+            del views, grid
+        except _MeshTimeout as e:
+            signal.alarm(0)
+            _emit_error({"item": item, "op": op}, "render_timeout", str(e))
+            n_errors += 1
+            del m
+            gc.collect(); torch.cuda.empty_cache()
+            continue
         except Exception as e:
+            signal.alarm(0)
             _emit_error({"item": item, "op": op}, "render", str(e))
             n_errors += 1
+            del m
+            gc.collect(); torch.cuda.empty_cache()
             continue
+        finally:
+            signal.alarm(0)
 
-        pending.append({"item": item, "mesh": m, "op": op})
+        # Stage 4 immediately (also under timeout), then drop the mesh to
+        # bound peak memory.
+        s4_dict = None
+        signal.signal(signal.SIGALRM, _alarm_handler)
+        signal.alarm(PER_MESH_TIMEOUT_S)
+        try:
+            report = filter_geometry(m, cfg=cfg, vae=vae, verbose=False)
+            s4_dict = {
+                "is_valid": bool(report.is_valid),
+                "reasons": list(report.reasons),
+                "metrics": dict(report.metrics),
+                "seconds": float(report.seconds),
+            }
+            del report
+        except _MeshTimeout as e:
+            _emit_error({"item": item, "op": op}, "stage4_timeout", str(e))
+            n_errors += 1
+            signal.alarm(0)
+            del m
+            gc.collect(); torch.cuda.empty_cache()
+            continue
+        except Exception as e:
+            _emit_error({"item": item, "op": op}, "stage4_fail", str(e))
+            n_errors += 1
+            signal.alarm(0)
+            del m
+            gc.collect(); torch.cuda.empty_cache()
+            continue
+        finally:
+            signal.alarm(0)
+            del m
+            gc.collect(); torch.cuda.empty_cache()
+
+        pending.append({"item": item, "op": op, "stage4_report": s4_dict})
         if len(pending) >= batch_size:
-            flush_batch(pending)
+            flush_vlm_batch(pending)
             n_done += len(pending)
             pending = []
             elapsed = time.time() - t_start
@@ -291,7 +368,7 @@ def worker_main(gpu_id: int, work_chunk: list[dict],
                   f"elapsed={elapsed/60:.1f}min", flush=True)
 
     if pending:
-        flush_batch(pending)
+        flush_vlm_batch(pending)
         n_done += len(pending)
 
     daemon.close()
@@ -303,9 +380,15 @@ def worker_main(gpu_id: int, work_chunk: list[dict],
 # ---------------------------------------------------------------------------
 # Aggregator
 # ---------------------------------------------------------------------------
-def aggregate(only: str | None = None) -> None:
+def aggregate(only: str | list | None = None) -> None:
+    if isinstance(only, str):
+        only_set = {x.strip() for x in only.split(",") if x.strip()}
+    elif only is None:
+        only_set = None
+    else:
+        only_set = set(only)
     for ds in DATASETS:
-        if only and ds != only:
+        if only_set and ds not in only_set:
             continue
         base = BASE / ds / OUT_SUBDIR
         rep_dir = base / "_reports"
@@ -374,12 +457,18 @@ def aggregate(only: str | None = None) -> None:
 # ---------------------------------------------------------------------------
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--num-gpus", type=int, default=8)
+    ap.add_argument("--num-workers", type=int, default=8,
+                    help="Total worker processes when shell-launched")
+    ap.add_argument("--worker-id", type=int, default=-1,
+                    help="If >=0, run as a single worker for this slice; "
+                         "GPU pinning must be done by the launcher via "
+                         "CUDA_VISIBLE_DEVICES.")
     ap.add_argument("--batch-size", type=int, default=4)
     ap.add_argument("--limit-per-dataset", type=int, default=0,
                     help="Process only first N meshes per dataset (0=all)")
     ap.add_argument("--dataset", default=None,
-                    help="Restrict to one dataset (hssd / ABO / renders_ruiming / renders_123)")
+                    help="Restrict to one or more datasets (comma-separated). "
+                         "E.g. 'hssd', 'hssd,ABO'. Default: all 4 in DATASETS.")
     ap.add_argument("--no-vae", action="store_true",
                     help="Skip Stage 4 VAE chamfer (faster, less faithful)")
     ap.add_argument("--prompt-lang", default="en")
@@ -397,30 +486,29 @@ def main() -> int:
     if not meshes:
         return 0
 
-    # Even split across GPUs
-    chunks: list[list[dict]] = [[] for _ in range(args.num_gpus)]
-    for i, m in enumerate(meshes):
-        chunks[i % args.num_gpus].append(m)
-
-    print(f"chunks: " + ", ".join(str(len(c)) for c in chunks), flush=True)
-
-    procs: list[mp.Process] = []
-    ctx = mp.get_context("spawn")
-    for gid in range(args.num_gpus):
-        p = ctx.Process(
-            target=worker_main,
-            args=(gid, chunks[gid], args.batch_size, not args.no_vae,
-                  args.prompt_lang),
+    # Even split across workers (deterministic: round-robin so chunk[i] is
+    # the same regardless of which workers participate).
+    n = args.num_workers
+    if args.worker_id >= 0:
+        # Single-worker mode (called by launcher; GPU already pinned).
+        chunk = [m for i, m in enumerate(meshes) if i % n == args.worker_id]
+        print(f"[worker {args.worker_id}/{n}] slice size = {len(chunk)}",
+              flush=True)
+        worker_main(
+            gpu_id=args.worker_id, work_chunk=chunk,
+            batch_size=args.batch_size, do_vae=not args.no_vae,
+            prompt_lang=args.prompt_lang,
+            visible_device="",   # don't override; launcher already pinned
         )
-        p.start()
-        procs.append(p)
+        return 0
 
-    for p in procs:
-        p.join()
-
-    print("[main] all workers done; aggregating...", flush=True)
-    aggregate(only=args.dataset)
-    return 0
+    # Default: print launch instructions + abort. (mp.Process forking +
+    # CUDA_VISIBLE_DEVICES per child is fragile — we observed a worker
+    # silently load on the wrong GPU. Use shell launcher instead.)
+    print("Use scripts/launch_batch_filter.sh for multi-GPU launching, or "
+          "pass --worker-id explicitly with CUDA_VISIBLE_DEVICES set.",
+          flush=True)
+    return 1
 
 
 if __name__ == "__main__":
