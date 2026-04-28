@@ -340,21 +340,20 @@ def worker_main(gpu_id: int, work_chunk: list[dict],
         except _MeshTimeout as e:
             _emit_error({"item": item, "op": op}, "stage4_timeout", str(e))
             n_errors += 1
-            signal.alarm(0)
-            del m
-            gc.collect(); torch.cuda.empty_cache()
-            continue
+            s4_dict = None
         except Exception as e:
             _emit_error({"item": item, "op": op}, "stage4_fail", str(e))
             n_errors += 1
-            signal.alarm(0)
-            del m
-            gc.collect(); torch.cuda.empty_cache()
-            continue
+            s4_dict = None
         finally:
             signal.alarm(0)
-            del m
+            try:
+                del m
+            except NameError:
+                pass
             gc.collect(); torch.cuda.empty_cache()
+        if s4_dict is None:
+            continue
 
         pending.append({"item": item, "op": op, "stage4_report": s4_dict})
         if len(pending) >= batch_size:
