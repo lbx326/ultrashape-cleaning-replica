@@ -335,21 +335,40 @@ class Qwen3VLClient:
         do_sample: bool = False,
         temperature: float = 0.1,
     ) -> str:
-        """Run inference on one image + prompt, return decoded assistant text.
+        """Run inference on one image + prompt; thin wrapper around generate_batch."""
+        return self.generate_batch(
+            [image_path], prompt,
+            max_new_tokens=max_new_tokens,
+            do_sample=do_sample,
+            temperature=temperature,
+        )[0]
 
-        We use the Qwen3-VL chat template with a single user turn that embeds
-        one image. Matches the sample in infer_sample.py.
+    def generate_batch(
+        self,
+        image_paths: list,
+        prompt: str,
+        max_new_tokens: int = 512,
+        do_sample: bool = False,
+        temperature: float = 0.1,
+    ) -> list:
+        """Batched inference: same prompt, N images -> N decoded strings.
+
+        Padding+attention_mask handled by the processor when tokenizing a list
+        of conversations. Output order matches input order.
         """
         import torch
-        messages = [
-            {"role": "user", "content": [
-                {"type": "image", "image": str(image_path)},
-                {"type": "text",  "text": prompt},
-            ]},
+        if not image_paths:
+            return []
+        messages_list = [
+            [{"role": "user", "content": [
+                {"type": "image", "image": str(p)},
+                {"type": "text", "text": prompt},
+            ]}]
+            for p in image_paths
         ]
         inputs = self.processor.apply_chat_template(
-            messages, tokenize=True, add_generation_prompt=True,
-            return_dict=True, return_tensors="pt",
+            messages_list, tokenize=True, add_generation_prompt=True,
+            return_dict=True, return_tensors="pt", padding=True,
         )
         inputs = inputs.to(self.model.device)
         gen_kwargs = dict(max_new_tokens=max_new_tokens,
@@ -360,20 +379,90 @@ class Qwen3VLClient:
 
         with torch.inference_mode():
             gen_ids = self.model.generate(**inputs, **gen_kwargs)
-        gen_trimmed = [
-            out_ids[len(in_ids):] for in_ids, out_ids
-            in zip(inputs.input_ids, gen_ids)
-        ]
-        out = self.processor.batch_decode(
-            gen_trimmed, skip_special_tokens=True,
-            clean_up_tokenization_spaces=False,
-        )[0]
-        return out
+        outs = []
+        for in_ids, out_ids in zip(inputs.input_ids, gen_ids):
+            trimmed = out_ids[len(in_ids):]
+            text = self.processor.batch_decode(
+                [trimmed], skip_special_tokens=True,
+                clean_up_tokenization_spaces=False,
+            )[0]
+            outs.append(text)
+        return outs
 
 
 # ---------------------------------------------------------------------------
 # High-level Stage 2 driver
 # ---------------------------------------------------------------------------
+def run_vlm_filter_batch(
+    items: list,
+    client: "Qwen3VLClient",
+    prompt: str = DEFAULT_PROMPT_EN,
+    prompt_lang: str = "en",
+    cache_dir: Optional[PathLike] = None,
+    max_new_tokens: int = 512,
+    accept_cfg: Optional[dict] = None,
+) -> list:
+    """Batched Stage 2: list of (grid_png, mesh_sha256) -> list of VLMResult.
+
+    Cache hits short-circuit (per item). Cache misses are batched into a single
+    Qwen3-VL forward pass; results are written to the cache and returned in the
+    same order as ``items``.
+    """
+    accept_cfg = accept_cfg or {}
+    cache_dir = Path(cache_dir) if cache_dir else None
+    if cache_dir:
+        cache_dir.mkdir(parents=True, exist_ok=True)
+
+    results: list = [None] * len(items)
+    pending_idx: list = []
+    pending_paths: list = []
+
+    for i, (grid_png, sha) in enumerate(items):
+        cache_file = cache_dir / f"{sha}.json" if cache_dir else None
+        if cache_file and cache_file.exists():
+            try:
+                cached = json.loads(cache_file.read_text(encoding="utf-8"))
+                results[i] = VLMResult(**cached)
+                continue
+            except Exception:
+                pass
+        pending_idx.append(i)
+        pending_paths.append(str(grid_png))
+
+    if pending_paths:
+        t = time.time()
+        raws = client.generate_batch(
+            pending_paths, prompt, max_new_tokens=max_new_tokens,
+        )
+        per_secs = (time.time() - t) / max(len(pending_paths), 1)
+        for k, raw in zip(pending_idx, raws):
+            grid_png, sha = items[k]
+            parsed = parse_vlm_response(raw)
+            accepted, reasons = _accept_decision(parsed, **accept_cfg)
+            r = VLMResult(
+                mesh_sha256=sha,
+                aesthetic_quality=parsed.get("aesthetic_quality"),
+                is_primitive=parsed.get("is_primitive"),
+                is_ground_plane=parsed.get("is_ground_plane"),
+                is_noisy_scan=parsed.get("is_noisy_scan"),
+                is_fragmented=parsed.get("is_fragmented"),
+                object_class=parsed.get("object_class"),
+                reasoning=parsed.get("reasoning", ""),
+                accepted=accepted,
+                rejection_reasons=reasons,
+                raw_response=raw,
+                model=client.model_name,
+                prompt_lang=prompt_lang,
+                seconds=per_secs,
+            )
+            results[k] = r
+            if cache_dir:
+                (cache_dir / f"{sha}.json").write_text(
+                    r.to_json(), encoding="utf-8"
+                )
+    return results
+
+
 def run_vlm_filter(
     grid_png: PathLike,
     mesh_sha256: str,
@@ -491,6 +580,55 @@ def _cli_serve(args: argparse.Namespace) -> int:
             continue
         if req.get("cmd") == "quit":
             break
+
+        # Batch path: caller sends {"cmd": "infer_batch", "items": [{...}, ...]}
+        # Items share prompt_lang. Each item: {grid, mesh_id, out_json?, cache_dir?}.
+        if req.get("cmd") == "infer_batch":
+            items_in = req.get("items") or []
+            try:
+                lang = req.get("prompt_lang", "en")
+                prompt = DEFAULT_PROMPT_ZH if lang == "zh" else DEFAULT_PROMPT_EN
+                pairs = [(it["grid"], it["mesh_id"]) for it in items_in]
+                # Each item may have its own cache_dir; group by cache_dir.
+                from collections import defaultdict
+                groups: dict = defaultdict(list)
+                for idx, it in enumerate(items_in):
+                    groups[it.get("cache_dir")].append(idx)
+                results_by_idx: dict = {}
+                for cdir, idxs in groups.items():
+                    sub_pairs = [pairs[i] for i in idxs]
+                    sub_results = run_vlm_filter_batch(
+                        sub_pairs, client=client, prompt=prompt,
+                        prompt_lang=lang, cache_dir=cdir,
+                    )
+                    for i, r in zip(idxs, sub_results):
+                        results_by_idx[i] = r
+                # Optional per-item out_json write (cache already stored, but
+                # the original protocol also wrote out_json mirroring caller's
+                # requested path).
+                for i, it in enumerate(items_in):
+                    op = it.get("out_json")
+                    if op and i in results_by_idx:
+                        Path(op).parent.mkdir(parents=True, exist_ok=True)
+                        Path(op).write_text(results_by_idx[i].to_json(),
+                                            encoding="utf-8")
+                _sys.stdout.write(json.dumps({
+                    "ok": True,
+                    "results": [
+                        dataclasses.asdict(results_by_idx[i])
+                        for i in range(len(items_in))
+                    ],
+                }, ensure_ascii=False) + "\n")
+                _sys.stdout.flush()
+            except Exception as e:
+                import traceback
+                _sys.stdout.write(json.dumps({
+                    "ok": False, "error": str(e),
+                    "traceback": traceback.format_exc()[-500:],
+                }) + "\n")
+                _sys.stdout.flush()
+            continue
+
         try:
             prompt = (DEFAULT_PROMPT_ZH
                       if req.get("prompt_lang") == "zh"

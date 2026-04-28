@@ -149,6 +149,44 @@ class VLMDaemonClient:
             self._kill()
             raise VLMDaemonReadyError(f"VLM sidecar ready=False: {info}")
 
+    def infer_batch(self, items: list, prompt_lang: str = "en",
+                    timeout: float = 600.0) -> list:
+        """Send N items in one request; daemon does a single Qwen3-VL forward.
+
+        Each item: {"grid": "...", "mesh_id": "...", "out_json"?: "...",
+                    "cache_dir"?: "..."}
+        Returns list of VLMResult-as-dict in the same order as ``items``.
+        """
+        import threading
+        req = {"cmd": "infer_batch", "items": items, "prompt_lang": prompt_lang}
+        self.proc.stdin.write(self._json.dumps(req) + "\n")
+        self.proc.stdin.flush()
+        line_container: list = []
+
+        def _read_line():
+            try:
+                line_container.append(self.proc.stdout.readline())
+            except Exception:
+                line_container.append("")
+
+        t = threading.Thread(target=_read_line, daemon=True)
+        t.start()
+        t.join(timeout=timeout)
+        if t.is_alive() or not line_container:
+            raise TimeoutError(
+                f"VLM sidecar did not respond within {timeout}s for batch of "
+                f"{len(items)}"
+            )
+        line = line_container[0]
+        if not line:
+            raise RuntimeError(
+                "VLM sidecar closed stdout while processing batch"
+            )
+        resp = self._json.loads(line)
+        if not resp.get("ok"):
+            raise RuntimeError(f"VLM batch failed: {resp.get('error')}")
+        return resp["results"]
+
     def infer(self, grid_png: str, mesh_id: str, out_json: Optional[str] = None,
               cache_dir: Optional[str] = None, prompt_lang: str = "en",
               timeout: float = 300.0) -> dict:
